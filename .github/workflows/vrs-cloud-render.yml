@@ -1,0 +1,61 @@
+name: VRS Cloud Render
+run-name: VRS ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        required: true
+        type: string
+      expected_sha:
+        required: true
+        type: string
+      preset:
+        required: true
+        type: choice
+        options: [draft, standard, premium]
+permissions:
+  contents: read
+concurrency:
+  group: vrs-cloud-render
+  cancel-in-progress: false
+jobs:
+  capture:
+    if: github.sha == inputs.expected_sha && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Confirm public renderer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: test "$(gh api "repos/$GITHUB_REPOSITORY" --jq '.visibility')" = public
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/vrs-cloud
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22.23.5'
+      - name: Verify runner and install pinned rendering dependencies
+        working-directory: .github/vrs-cloud
+        run: |
+          test -x /opt/google/chrome/chrome
+          /opt/google/chrome/chrome --version
+          command -v ffmpeg
+          command -v ffprobe
+          npm ci --no-audit --no-fund
+      - name: Render the synthetic test fixture
+        env:
+          PRESET: ${{ inputs.preset }}
+          HYPERFRAMES_BROWSER_PATH: /opt/google/chrome/chrome
+          HYPERFRAMES_CHROME_SANDBOX: '1'
+        run: |
+          python3 .github/vrs-cloud/cloud_worker.py --preset "$PRESET" \
+            --dependencies "$GITHUB_WORKSPACE/.github/vrs-cloud" \
+            --stage "$RUNNER_TEMP/staged" --output "$RUNNER_TEMP/delivery"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: visual-master
+          path: ${{ runner.temp }}/delivery/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1

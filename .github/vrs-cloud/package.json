@@ -1,0 +1,14 @@
+{
+  "name": "viral-reel-studio-engine",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "hyperframes": "hyperframes"
+  },
+  "dependencies": {
+    "hyperframes": "0.9.88",
+    "three": "0.170.0"
+  }
+}
