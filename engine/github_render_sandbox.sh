@@ -14,21 +14,7 @@ test "${python#"$python_home"/bin/}" != "$python"
 ffmpeg=$(realpath "$(command -v ffmpeg)")
 ffprobe=$(realpath "$(command -v ffprobe)")
 if [[ ${1:-} == probe ]]; then
-  command=("$python" -c '
-import os, re, socket, subprocess
-assert {name for _, name in socket.if_nameindex()} == {"lo"}
-assert "GH_TOKEN" not in os.environ and "GITHUB_ENV" not in os.environ
-with socket.socket() as sock:
-    sock.bind(("127.0.0.1", 0))
-page = subprocess.check_output(["/tools/vrs-chrome", "--headless", "--disable-gpu",
-                                "--disable-dev-shm-usage", "--dump-dom", "chrome://sandbox"],
-                               text=True, timeout=30)
-status = re.sub(r"<[^>]+>", " ", page)
-for label in ("Namespace Sandbox", "PID namespaces", "Seccomp-BPF sandbox"):
-    if not re.search(r"\b" + re.escape(label) + r"\s+Yes\b", status):
-        raise RuntimeError("Chrome did not confirm " + label)
-subprocess.run(["/tools/ffmpeg", "-version"], check=True)
-')
+  command=("$python" /engine/github_sandbox_probe.py)
 else
   command=("$python" /engine/github_production.py render /job)
 fi
