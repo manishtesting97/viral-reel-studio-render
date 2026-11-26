@@ -14,7 +14,7 @@ test "${python#"$python_home"/bin/}" != "$python"
 ffmpeg=$(realpath "$(command -v ffmpeg)")
 ffprobe=$(realpath "$(command -v ffprobe)")
 if [[ ${1:-} == probe ]]; then
-  command=("$python" /engine/github_sandbox_probe.py)
+  command=(/tools/node /engine/github_sandbox_probe.mjs)
 else
   command=("$python" /engine/github_production.py render /job)
 fi
