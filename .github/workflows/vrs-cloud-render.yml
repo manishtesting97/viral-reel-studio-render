@@ -13,6 +13,11 @@ on:
         required: true
         type: choice
         options: [draft, standard, premium]
+      fixture:
+        required: false
+        type: choice
+        default: premium-showcase
+        options: [premium-showcase, smoke]
 permissions:
   contents: read
 concurrency:
@@ -22,7 +27,7 @@ jobs:
   capture:
     if: github.sha == inputs.expected_sha && github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Confirm public renderer
         env:
@@ -52,18 +57,23 @@ jobs:
       - name: Verify runner and install pinned rendering dependencies
         working-directory: .github/vrs-cloud
         run: |
+          nproc
+          grep -E '^(MemTotal|Model name)' /proc/meminfo /proc/cpuinfo || true
           test -x /opt/google/chrome/chrome
           /opt/google/chrome/chrome --version
-          command -v ffmpeg
+          ffmpeg -version | head -n 2
+          ffmpeg -hide_banner -filters | grep -w ass
           command -v ffprobe
           npm ci --no-audit --no-fund
       - name: Render the synthetic test fixture
         env:
           PRESET: ${{ inputs.preset }}
+          FIXTURE: ${{ inputs.fixture || 'premium-showcase' }}
           HYPERFRAMES_BROWSER_PATH: /opt/google/chrome/chrome
           HYPERFRAMES_CHROME_SANDBOX: '1'
         run: |
           python3 .github/vrs-cloud/cloud_worker.py --preset "$PRESET" \
+            --fixture "$FIXTURE" \
             --dependencies "$GITHUB_WORKSPACE/.github/vrs-cloud" \
             --stage "$RUNNER_TEMP/staged" --output "$RUNNER_TEMP/delivery"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
