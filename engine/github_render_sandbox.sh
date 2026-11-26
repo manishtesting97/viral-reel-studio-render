@@ -1,20 +1,28 @@
 #!/bin/bash
 # Fail closed if the runner cannot isolate the browser and FFmpeg.
 set -euo pipefail
+if [[ ${0##*/} == vrs-chrome ]]; then
+  # Bubblewrap prevents setuid elevation. Require Chrome’s user-namespace sandbox instead.
+  exec /opt/google/chrome/chrome --disable-setuid-sandbox "$@"
+fi
 engine=$(cd -- "$(dirname -- "$0")" && pwd)
 node=$(realpath "$(command -v node)")
 ffmpeg=$(realpath "$(command -v ffmpeg)")
 ffprobe=$(realpath "$(command -v ffprobe)")
 if [[ ${1:-} == probe ]]; then
   command=(/usr/bin/python3 -c '
-import os, socket, subprocess
+import os, re, socket, subprocess
 assert {name for _, name in socket.if_nameindex()} == {"lo"}
 assert "GH_TOKEN" not in os.environ and "GITHUB_ENV" not in os.environ
 with socket.socket() as sock:
     sock.bind(("127.0.0.1", 0))
-subprocess.run(["/opt/google/chrome/chrome", "--headless", "--disable-gpu",
-                "--disable-dev-shm-usage", "--dump-dom", "about:blank"],
-               check=True, timeout=30)
+page = subprocess.check_output(["/tools/vrs-chrome", "--headless", "--disable-gpu",
+                                "--disable-dev-shm-usage", "--dump-dom", "chrome://sandbox"],
+                               text=True, timeout=30)
+status = re.sub(r"<[^>]+>", " ", page)
+for label in ("Namespace Sandbox", "PID namespaces", "Seccomp-BPF sandbox"):
+    if not re.search(r"\b" + re.escape(label) + r"\s+Yes\b", status):
+        raise RuntimeError("Chrome did not confirm " + label)
 subprocess.run(["/tools/ffmpeg", "-version"], check=True)
 ')
 else
@@ -28,5 +36,6 @@ exec bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --ro-bind "$VRS_JOB/transfer.json" /job/transfer.json \
   --ro-bind "$node" /tools/node --ro-bind "$ffmpeg" /tools/ffmpeg --ro-bind "$ffprobe" /tools/ffprobe \
   --setenv PATH /tools:/usr/bin --setenv HOME /tmp --setenv LANG C.UTF-8 \
-  --setenv VRS_REMOTE_BROWSER /opt/google/chrome/chrome \
+  --ro-bind "$engine/github_render_sandbox.sh" /tools/vrs-chrome \
+  --setenv VRS_REMOTE_BROWSER /tools/vrs-chrome \
   --chdir /job "${command[@]}"
