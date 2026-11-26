@@ -42,15 +42,30 @@ jobs:
             --no-same-owner --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
           test -x "$tools/ffmpeg" && test -x "$tools/ffprobe"
           printf '%s\n' "$tools" >> "$GITHUB_PATH"
-      - name: Install pinned renderer and verify tools
+      - name: Install pinned renderer prerequisites
         run: |
-          printf 'VRS_JOB=%s/vrs-hybrid-job\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-          command -v bwrap >/dev/null
-          bwrap --unshare-all --ro-bind /usr /usr --ro-bind /lib /lib --ro-bind /lib64 /lib64 /usr/bin/true
+          source /etc/os-release
+          test "$ID:$VERSION_ID:$(dpkg --print-architecture)" = ubuntu:24.04:amd64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap=0.9.0-1ubuntu0.3
+          bwrap --version
+          node --version
+          python3 --version
+          gh --version
           npm --prefix engine ci --no-audit --no-fund
           test -x /opt/google/chrome/chrome
-          command -v ffprobe
+          ffprobe -version
           ffmpeg -hide_banner -filters | grep -w ass
+          ffmpeg -hide_banner -encoders | grep -w libx264
+          ffmpeg -hide_banner -encoders | grep -w aac
+          printf 'VRS_JOB=%s/vrs-hybrid-job\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Verify offline namespace and sandboxed Chrome without media
+        run: |
+          umask 077
+          preflight=$(mktemp -d "$RUNNER_TEMP/vrs-prerequisites.XXXXXX")
+          trap 'rm -rf -- "$preflight"' EXIT
+          touch "$preflight/transfer.json"
+          VRS_JOB="$preflight" bash engine/github_render_sandbox.sh probe
       - name: Verify private input
         if: ${{ !inputs.probe }}
         env:
@@ -74,20 +89,13 @@ jobs:
           umask 077
           python3 engine/github_production.py upload "$VRS_JOB" >/dev/null 2>&1 ||
             { echo 'Private output transfer failed'; exit 1; }
-      - name: Verify hosted isolation without media
-        if: inputs.probe
-        run: |
-          umask 077
-          mkdir "$VRS_JOB"
-          touch "$VRS_JOB/transfer.json"
-          bash engine/github_render_sandbox.sh probe >/dev/null 2>&1 ||
-            { echo 'Hosted isolation check failed'; exit 1; }
       - name: Verify restricted private transfer without media
         if: inputs.probe
         env:
           GH_TOKEN: ${{ secrets.VRS_PRIVATE_TRANSFER_TOKEN }}
         run: |
           umask 077
+          mkdir "$VRS_JOB"
           python3 engine/github_production.py probe "$VRS_JOB" >/dev/null 2>&1 ||
             { echo 'Restricted transfer check failed'; exit 1; }
       - name: Remove runner media
