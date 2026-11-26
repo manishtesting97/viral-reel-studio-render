@@ -7,10 +7,14 @@ if [[ ${0##*/} == vrs-chrome ]]; then
 fi
 engine=$(cd -- "$(dirname -- "$0")" && pwd)
 node=$(realpath "$(command -v node)")
+# Jammy's system Python is too old for the renderer. Mount only the selected toolchain.
+python=$(realpath "$(command -v python3)")
+python_home=$("$python" -c 'import sys; print(sys.base_prefix)')
+test "${python#"$python_home"/bin/}" != "$python"
 ffmpeg=$(realpath "$(command -v ffmpeg)")
 ffprobe=$(realpath "$(command -v ffprobe)")
 if [[ ${1:-} == probe ]]; then
-  command=(/usr/bin/python3 -c '
+  command=("$python" -c '
 import os, re, socket, subprocess
 assert {name for _, name in socket.if_nameindex()} == {"lo"}
 assert "GH_TOKEN" not in os.environ and "GITHUB_ENV" not in os.environ
@@ -26,7 +30,7 @@ for label in ("Namespace Sandbox", "PID namespaces", "Seccomp-BPF sandbox"):
 subprocess.run(["/tools/ffmpeg", "-version"], check=True)
 ')
 else
-  command=(/usr/bin/python3 /engine/github_production.py render /job)
+  command=("$python" /engine/github_production.py render /job)
 fi
 exec bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
@@ -34,6 +38,7 @@ exec bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --proc /proc --dev /dev --tmpfs /tmp \
   --ro-bind "$engine" /engine --bind "$VRS_JOB" /job \
   --ro-bind "$VRS_JOB/transfer.json" /job/transfer.json \
+  --ro-bind "$python_home" "$python_home" \
   --ro-bind "$node" /tools/node --ro-bind "$ffmpeg" /tools/ffmpeg --ro-bind "$ffprobe" /tools/ffprobe \
   --setenv PATH /tools:/usr/bin --setenv HOME /tmp --setenv LANG C.UTF-8 \
   --ro-bind "$engine/github_render_sandbox.sh" /tools/vrs-chrome \
