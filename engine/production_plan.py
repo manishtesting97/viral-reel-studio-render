@@ -163,28 +163,26 @@ def production_prompt(project, config, badge=None):
     brief_id = str(config.get("id") or "reel-plan").strip() or "reel-plan"
     creator_name = str(brand.get("ownerName") or brand.get("brandName") or brand.get("id") or "Creator").strip()
     handle_raw = str(brand.get("instagramUsername") or brand.get("handle") or "").strip().lstrip("@")
-    if not handle_raw and str(brand.get("id") or config.get("brand") or "").strip() == "manishjangra97":
-        handle_raw = "manishjangra97"
     handle = f"@{handle_raw}" if handle_raw else ""
     raw_cta = brand.get("cta")
     brand_cta = str(raw_cta).strip() if isinstance(raw_cta, str) else ""
     cta_enabled = raw_cta is not False and brand_cta.casefold() not in {"none", "off", "disabled"} and bool(brand_cta or handle)
     profile_picture = str(brand.get("profilePicture") or "").strip()
     if cta_enabled:
-        identity_bits = [part for part in (creator_name, handle, f'brand CTA "{brand_cta}"' if brand_cta else "") if part]
-        asset_note = (f'include "{profile_picture}" in assets and ' if profile_picture else "")
+        profile_title = str(brand.get("profileTitle") or "").strip()
+        identity_bits = [part for part in (creator_name, handle, profile_title,
+                                           f'brand CTA "{brand_cta}"' if brand_cta else "") if part]
+        asset_note = (f'The approved component uses the configured photo "{profile_picture}". ' if profile_picture else "")
         cta_guidance = (
             f"Instagram Follow CTA ({', '.join(identity_bits)}): end the reel with one short, natural, topic-relevant "
             f"spoken follow CTA scene (~3 to 5 seconds) inside total brief.duration (set outro to 0 so no duplicate "
             "spoken or visual outro is added). Adapt the CTA naturally to brief.topic and brief.language instead of "
             "using identical boilerplate; only use this brand profile's creator name, handle "
             + (f"({handle}) " if handle else "")
-            + "and CTA setting—never insert another creator's name or handle. Example style only: "
-            f'"Aisi interesting jaankari ke liye Instagram par {creator_name} ko follow karo." '
-            f"For this closing CTA scene (id \"creator-cta\", without storyboard.artwork so the engine reuses the "
-            f"existing creator_cta_outro and profile photo), {asset_note}keep all spoken CTA words in scene.narration, "
-            "captions and storyboard.events word anchors (for example revealing creator-profile and triggering follow-cta "
-            "on the spoken follow phrase) so visual animation stays synchronized with narration. "
+            + "and CTA setting. Use closing scene id \"creator-cta\" and the approved creator_cta_outro component. "
+            "Omit storyboard.artwork and storyboard.model for this scene. "
+            f"{asset_note}Use the exact spoken follow phrase in scene.narration as the storyboard.events anchor "
+            "for follow-cta. Preserve the configured name, handle and profile title on screen. "
         )
     else:
         cta_guidance = (
@@ -200,13 +198,18 @@ def production_prompt(project, config, badge=None):
           "niche, audience, language and duration. Give viewers a genuine reason to stop scrolling and deliver the "
           "answer or payoff promised by the hook. Never use generic openers such as \"Hello guys\", "
           "\"Aaj hum baat karenge\" or empty greetings, and avoid clickbait, fake statistics or exaggerated claims. "
-          "Write a short, readable, impactful on-screen hook heading, make frame 0 visually engaging, and match "
+          "Write a short, readable, impactful on-screen hook heading. Make it visible from frame 0 where supported, "
+          "make the subject immediately recognizable, and match "
           "the opening visual and animation directly to the spoken hook. Vary hook formulas across reels rather than repeating one template. "
-          "Audience retention: maintain crisp, natural storytelling from hook to satisfying payoff; cut filler, "
-          "repetition and long-winded exposition; use relevant visual changes at meaningful narration beats with "
+          "Audience retention: build from hook through curiosity, demonstration, explanation and satisfying payoff to the brand-approved CTA. "
+          "Every sentence must teach something or advance the story. Cut repetition, filler and long definitions. Use relatable "
+          "examples, practical demonstrations and relevant visual changes at meaningful narration beats with "
           "curiosity, contrast, demonstration and clear explanation while preserving factual accuracy. "
           f"{cta_guidance}"
-          "Write natural, engaging, conversational narration that preserves strong hooks, storytelling, "
+          "\n\nVoiceover: write natural, engaging narration with the pacing of an experienced Indian creator. "
+          "For Hinglish projects, use natural Roman-script Hinglish with essential English technical terms and simple surrounding language. "
+          "Use the selected language and script for Hindi or English projects. Mentally read the script aloud, including "
+          "pauses, to fit the specified duration. Preserve strong hooks, storytelling, "
           "audience retention, essential technical terminology and factual accuracy without sacrificing content quality "
           "or inventing claims, statistics or recognition guarantees. "
           "For Hindi and Hinglish, prefer commonly spoken Indian words, short clear sentences with natural clause boundaries, "
@@ -228,17 +231,23 @@ def production_prompt(project, config, badge=None):
           "from voiceDirection.intents (or a bare tag from allowedTags) and a zero-based beforeWord "
           "index into the whitespace-separated narration (word count means after the last word). "
           "A cue can start a scene, a sentence or a meaningful clause within a sentence. Use cues and meaningful pauses "
-          "only when genuinely useful: highlight a hook, reveal, contrast or caution with a suitable emotion or delivery change. "
+          "only when genuinely useful. Consider curious for the hook, surprised for a real revelation, confident for an explanation, suspenseful for a meaningful build, pause for a natural break, and warm for the CTA. "
           "Do not return pause-only directions for every scene when the narration supports other expressions. "
           "Leave neutral scenes untagged. Add a vocal reaction only when the spoken beat warrants it. "
           "Avoid repetitive emotions, excessive dramatic pauses, whispering, overacting, artificial vocal reactions and irrelevant effects. "
           "Keep all spoken words identical across production JSON narration, voiceover.txt and voiceover-expressive.txt, "
           "never put direction tags in spoken narration or captions, and ensure beforeWord indices and phrase-based animation anchors "
           "match the final spoken wording. "
-          "Specify original scene-specific visuals; use the style profile as art direction and "
+          "\n\nVisual planning: specify original scene-specific visuals. Use referenceStyle as the authoritative art direction and "
+          "apply the selected style across niches. Isometric Tech Grid favors detailed perspective objects, mechanisms, "
+          "architecture and network flows. Warm Editorial Motion favors expressive pacing, dynamic typography and relatable "
+          "illustrations. Warm Editorial Explainer favors clear diagrams, comparisons and step-by-step demonstrations. Use "
           "the brand profile as identity. Asset entries are local relative filenames, never URLs. "
           "Choose the best visual medium for each explanatory scene. For subjects that benefit from depth, perspective or moving parts, "
           "supply storyboard.model with named box, sphere, cylinder, torus, loft or tube parts and appropriate materials and finishes. "
+          "Build recognizable objects with accurate proportions, layered structures and relevant details. Use supported "
+          "metalness, roughness and matte, brushed or rubber textures where useful. Use existing lighting to clarify "
+          "depth. Keep primitive counts proportionate and promise only the fidelity the renderer and real assets support. "
           "Set a perspective eye and look target. Use groundShadows false for suspended diagrams with no meaningful ground. "
           "Positions use scene units, rotations use degrees. "
           "A loft follows local X and uses sections [x, centerY, centerZ, radiusY, radiusZ] in increasing X order with positive radii; "
@@ -246,8 +255,11 @@ def production_prompt(project, config, badge=None):
           "outer X diameter and tube Z diameter. For other primitives use full dimensions. Reuse relevant project or licensed library media. "
           "Model events use exact spoken anchors. Reveal takes value [0,0,0]; move, rotate and camera take destination vectors. "
           "Use target camera to move the eye and assembly to move or rotate the whole model. "
+          "Use supported moves and rotations for cutaways, exploded views and changes of state. Use deliberate camera "
+          "push-ins or perspective changes to reveal relationships. Vary staging and avoid repeated entrances. "
           "For detailed 2D or original interface scenes supply `storyboard.artwork` with named layers of shapes that actually depict "
           "the objects, interfaces and relationships spoken about. Draw on a 944 by 760 canvas inside the safe zone. "
+          "Use accurate interface diagrams, isometric diagrams, scientific cross-sections or process flows as suitable. "
           "Shapes are rect, ellipse, path, text and image. Use box [x,y,width,height] for rect, ellipse and image. "
           "For text use box [x,y,0,0] (top-left), text and size. For paths supply SVG path data d. "
           "Use fill and stroke as hex colors or ink, accent, surface, border or none. Images must reference a real "
@@ -263,7 +275,22 @@ def production_prompt(project, config, badge=None):
           "to the specific requirement instead of artwork. This stops automatic substitution and permits supplied media "
           "or a reviewed custom scene. "
           "For a visual-only revision of a recorded plan, change storyboard.artwork or storyboard.model only to retain approved timing. "
+          "Mobile composition and typography: make the main object large enough to understand immediately, with balanced "
+          "top and bottom spacing and useful negative space. Keep headings, important parts and supporting labels clear "
+          "of each other, word captions and Instagram interface safe zones. Prefer headings of three to seven words, "
+          "strong contrast, accurate technical spelling, and minimal supporting labels. Use the existing word caption "
+          "style and configured active-word highlight. "
           "Do not fabricate product screenshots, medical claims, metrics or unsupported facts. "
+          "\n\nInstagram post: fill instagram.cover with a short compelling cover title, instagram.post with an engaging "
+          "accurate caption, instagram.cta with a natural topic-relevant call to action that respects brand settings, and "
+          "instagram.hashtags with a small set of relevant niche-specific tags. Avoid spam, exaggerated promises and "
+          "generic engagement bait. "
+          "\n\nMandatory JSON self-audit: silently validate the exact brief and schema, language and pronunciation, hook and "
+          "payoff, factual claims, spoken duration, contiguous scene cuts, scene-relative motion and audio cues, exact "
+          "anchors and supported actions targeting real layers or parts, model geometry and materials, and mobile framing. "
+          "Verify the selected brand, the supplied normal, ad or sponsor badge mode and title, the configured creator outro, "
+          "local asset paths, and one CTA where enabled. Remove unsupported fields and fix any issues before returning the "
+          "JSON. Use normal badge mode when no promotion is configured. Preserve approved sponsorship details. "
           f"Output format & downloadable JSON file: return one valid JSON object matching the schema below with zero "
           f"extra commentary inside the JSON, AND also generate and provide that exact JSON as a downloadable `.json` file "
           f"(`{brief_id}.json`) when file download output is supported in your environment.\n\n"
