@@ -32,6 +32,10 @@ DELIVERY = "output.zip"
 
 TOKEN_ENV = "VRS_GITHUB_PRODUCTION_TOKEN"
 SHA_ENV = "VRS_GITHUB_PRODUCTION_SHA"
+RUNNER_ENV = "VRS_GITHUB_RUNNER"
+RUNNER_MODES = ("auto", "self-hosted", "github-hosted")
+HOSTED_WORKLOADS = {"software-project", "agreement-covered"}
+_EXECUTION_CONTEXT = {}
 
 
 def credential():
@@ -197,12 +201,34 @@ def renderer_pin(cfg):
     return sha
 
 
-def preflight(sha, renderer_sha):
+def _online_self_hosted_runners(runners_payload):
+    runners = (runners_payload or {}).get("runners") if isinstance(runners_payload, dict) else None
+    matched = []
+    for runner in runners or ():
+        if not isinstance(runner, dict) or str(runner.get("status", "")).casefold() != "online":
+            continue
+        labels = {
+            str(lbl.get("name", "")).strip().casefold()
+            for lbl in (runner.get("labels") or ())
+            if isinstance(lbl, dict) and lbl.get("name")
+        }
+        os_name = str(runner.get("os", "")).casefold()
+        if labels and "self-hosted" not in labels:
+            continue
+        if "linux" not in labels and os_name != "linux":
+            continue
+        if ({"arm", "arm64", "aarch64", "windows", "macos"} & labels) or (os_name and os_name != "linux"):
+            continue
+        matched.append(runner)
+    return matched
+
+
+def _verify_repo_state():
     repo = check_repo()
     commit = api(f"{BASE}/commits/{quote(repo['default_branch'], safe='')}")
     private_flag = api(f"{BASE}/actions/variables/VRS_PRODUCTION_ENABLED", missing=True)
-    if commit["sha"] != sha or (private_flag and private_flag["value"].casefold() == "true"):
-        raise ValueError("Verify the private data commit and keep private rendering disabled.")
+    if private_flag and private_flag["value"].casefold() == "true":
+        raise ValueError("Keep private repository Actions execution disabled (`VRS_PRODUCTION_ENABLED`).")
     renderer = renderer_api("")
     branch = renderer["default_branch"]
     if (branch != "main" or renderer["full_name"].casefold() != RENDERER or renderer["visibility"] != "public"
@@ -210,26 +236,125 @@ def preflight(sha, renderer_sha):
         raise ValueError("Production capture requires the designated active public renderer.")
     workflow = renderer_api(f"/actions/workflows/{WORKFLOW}")
     pinned = renderer_api(f"/commits/{quote(branch, safe='')}")
-    if (pinned["sha"] != renderer_sha or workflow["state"] != "active"
-            or workflow["path"] != f".github/workflows/{WORKFLOW}"):
-        raise ValueError("Approve the deployed public production workflow commit before uploading.")
+    if workflow["state"] != "active" or workflow["path"] != f".github/workflows/{WORKFLOW}":
+        raise ValueError("Activate the reviewed public production workflow before uploading.")
     environment = renderer_api("/environments/vrs-hybrid-production")
     if environment.get("can_admins_bypass") is not False:
         raise ValueError("Disable administrator bypass on the protected production environment before uploading.")
     branches = renderer_api("/environments/vrs-hybrid-production/deployment-branch-policies")["branch_policies"]
     if {policy["name"] for policy in branches} != {"main"}:
         raise ValueError("Restrict the protected production environment to the main branch.")
+    return {
+        "privateSha": commit["sha"],
+        "rendererSha": pinned["sha"],
+        "branch": branch,
+        "workflow": workflow["id"],
+    }
+
+
+def _select_runner(runner_preference="auto"):
+    pref = (runner_preference or os.environ.get(RUNNER_ENV) or "auto").strip().casefold() or "auto"
+    if pref not in RUNNER_MODES:
+        raise ValueError("Choose Auto, Self-hosted, or GitHub-hosted for runner selection.")
+    runners_payload = renderer_api("/actions/runners", missing=True)
+    self_hosted = _online_self_hosted_runners(runners_payload)
+    if pref == "self-hosted":
+        if not self_hosted:
+            raise ValueError(
+                f"Self-hosted runner mode is selected, but no online Linux x64 self-hosted runner is registered on {RENDERER}. "
+                "Start an authorized self-hosted runner or switch runner selection to Auto or GitHub-hosted."
+            )
+        return "self-hosted", self_hosted, None
+    if pref == "auto" and self_hosted:
+        return "self-hosted", self_hosted, None
     workload = renderer_api("/actions/variables/VRS_HYBRID_WORKLOAD", missing=True)
-    classification, _, approved_sha = (workload or {}).get("value", "").partition(":")
+    raw_workload = str((workload or {}).get("value", "")).strip()
+    classification = raw_workload.partition(":")[0].strip().casefold()
+    if classification in HOSTED_WORKLOADS:
+        return "github-hosted", self_hosted, classification
     if classification == "content-production":
-        raise ValueError("GitHub-hosted rendering is unavailable for routine reel production under the standard Actions terms. "
-                         "Use explicit Local execution for this workload.")
-    if classification not in {"software-project", "agreement-covered"}:
-        raise ValueError("GitHub-hosted execution is disabled until this workload is classified under the applicable Actions terms.")
-    if approved_sha != renderer_sha:
-        raise ValueError("The GitHub workload configuration does not pin this verified renderer SHA. "
-                         "Update the workload configuration after confirming secure transfer and the $0 spending block.")
-    return branch, workflow["id"]
+        raise ValueError(
+            f"GitHub-hosted standard runners do not permit routine non-software content production under GitHub Actions Terms "
+            f"(VRS_HYBRID_WORKLOAD=content-production), and zero online Linux x64 self-hosted runners are available on {RENDERER}. "
+            "Register an authorized self-hosted runner, update VRS_HYBRID_WORKLOAD if running an eligible software-project or agreement-covered workload, "
+            "or explicitly choose Local execution."
+        )
+    raise ValueError(
+        f"No online Linux x64 self-hosted runner is registered on {RENDERER}, and VRS_HYBRID_WORKLOAD is not set to "
+        "software-project or agreement-covered for GitHub-hosted runners. "
+        "Register an authorized self-hosted runner, configure an eligible hosted workload classification, or explicitly choose Local execution."
+    )
+
+
+def synchronize_pins(cfg, *, config_path=None, compatibility_check=None):
+    saved, token = credential()
+    if cfg.get("privateRepo", "").casefold() != REPOSITORY or cfg.get("publicRepo", "").casefold() != RENDERER or not token:
+        raise ValueError(cloud.PRODUCTION_BLOCK)
+    state = _verify_repo_state()
+    private_sha = os.environ.get(SHA_ENV) or state["privateSha"]
+    renderer_sha = state["rendererSha"]
+    if not re.fullmatch(r"[a-f0-9]{40}", private_sha) or not re.fullmatch(r"[a-f0-9]{40}", renderer_sha):
+        raise ValueError("Could not resolve verified 40-character commits from GitHub.")
+    if private_sha != state["privateSha"]:
+        raise ValueError("Configured VRS_GITHUB_PRODUCTION_SHA does not match the current private default branch commit.")
+    if compatibility_check is not None:
+        compatibility_check(renderer_sha)
+    changed = (cfg.get("githubProductionSha") != private_sha or cfg.get("githubRendererSha") != renderer_sha)
+    cfg["githubProductionSha"] = private_sha
+    cfg["githubRendererSha"] = renderer_sha
+    if changed and config_path is not None:
+        cfg_file = Path(config_path)
+        current = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.is_file() else {}
+        if current.get("githubProductionSha") != private_sha or current.get("githubRendererSha") != renderer_sha:
+            current["githubProductionSha"] = private_sha
+            current["githubRendererSha"] = renderer_sha
+            cfg_file.write_text(json.dumps(current, indent=2) + "\n", encoding="utf-8")
+    if saved and saved.get("token") and saved.get("sha") != private_sha and not os.environ.get(SHA_ENV):
+        try:
+            github_credentials.save({**saved, "sha": private_sha})
+        except ValueError:
+            pass
+    return private_sha, renderer_sha
+
+
+def last_runner():
+    return _EXECUTION_CONTEXT.get("runner", "github-hosted")
+
+
+def execution_status(cfg, *, compatibility_check=None):
+    try:
+        sha, renderer_sha = synchronize_pins(dict(cfg), compatibility_check=compatibility_check)
+        runner, self_hosted, classification = _select_runner(cfg.get("githubRunner") or "auto")
+        return {
+            "available": True,
+            "runner": runner,
+            "selfHostedOnline": len(self_hosted),
+            "workload": classification or "self-hosted",
+            "githubProductionSha": sha,
+            "githubRendererSha": renderer_sha,
+            "reason": None,
+        }
+    except Exception as error:
+        return {
+            "available": False,
+            "runner": None,
+            "selfHostedOnline": 0,
+            "workload": None,
+            "githubProductionSha": cfg.get("githubProductionSha"),
+            "githubRendererSha": cfg.get("githubRendererSha"),
+            "reason": str(error),
+        }
+
+
+def preflight(sha, renderer_sha, *, runner_preference="auto"):
+    state = _verify_repo_state()
+    if state["privateSha"] != sha:
+        raise ValueError("Private repository commit changed. Retry so pins synchronize with the verified default branch.")
+    if state["rendererSha"] != renderer_sha:
+        raise ValueError("Public renderer commit changed. Retry so pins synchronize with the verified default branch.")
+    runner, _, _ = _select_runner(runner_preference)
+    _EXECUTION_CONTEXT["runner"] = runner
+    return state["branch"], state["workflow"]
 
 
 def tag(request):

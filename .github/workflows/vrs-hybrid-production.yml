@@ -5,6 +5,11 @@ on:
     inputs:
       request_id: {type: string, required: true}
       expected_sha: {type: string, required: true}
+      runner:
+        type: choice
+        options: [github-hosted, self-hosted]
+        default: github-hosted
+        required: false
       probe: {type: boolean, default: false}
 permissions:
   contents: read
@@ -18,12 +23,14 @@ jobs:
       github.repository == 'manishtesting97/viral-reel-studio-render' &&
       !github.event.repository.private && github.ref == 'refs/heads/main' &&
       github.sha == inputs.expected_sha &&
-      ((inputs.probe && github.sha == vars.VRS_HYBRID_PROBE_SHA) ||
-       (!inputs.probe &&
-        (vars.VRS_HYBRID_WORKLOAD == format('software-project:{0}', github.sha) ||
-         vars.VRS_HYBRID_WORKLOAD == format('agreement-covered:{0}', github.sha))))
+      (inputs.probe ||
+       inputs.runner == 'self-hosted' ||
+       vars.VRS_HYBRID_WORKLOAD == 'software-project' ||
+       vars.VRS_HYBRID_WORKLOAD == 'agreement-covered' ||
+       startsWith(vars.VRS_HYBRID_WORKLOAD, 'software-project:') ||
+       startsWith(vars.VRS_HYBRID_WORKLOAD, 'agreement-covered:'))
     environment: vrs-hybrid-production
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.runner == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-22.04"]') }}
     timeout-minutes: 30
     steps:
       - name: 01 · Environment and security · refuse debug logging
@@ -56,15 +63,23 @@ jobs:
       - name: Install pinned renderer prerequisites
         run: |
           source /etc/os-release
-          test "$ID:$VERSION_ID:$(dpkg --print-architecture)" = ubuntu:22.04:amd64
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bubblewrap=0.6.1-1ubuntu0.3
+          if [ "${{ inputs.runner }}" = "self-hosted" ]; then
+            test "$(uname -s):$(dpkg --print-architecture)" = Linux:amd64
+            if ! command -v bwrap >/dev/null 2>&1; then
+              sudo -n apt-get update
+              sudo -n apt-get install -y --no-install-recommends bubblewrap
+            fi
+          else
+            test "$ID:$VERSION_ID:$(dpkg --print-architecture)" = ubuntu:22.04:amd64
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends bubblewrap=0.6.1-1ubuntu0.3
+          fi
           bwrap --version
           node --version
           python3 --version
           gh --version
           npm --prefix engine ci --no-audit --no-fund
-          test -x /opt/google/chrome/chrome
+          test -x /opt/google/chrome/chrome || command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser
           ffprobe -version
           ffmpeg -hide_banner -filters | grep -w ass
           ffmpeg -hide_banner -encoders | grep -w libx264
@@ -220,6 +235,7 @@ jobs:
       - name: Summarize completed work without private content
         if: ${{ always() && !inputs.probe }}
         env:
+          RUNNER_MODE: ${{ inputs.runner || 'github-hosted' }}
           TRANSCRIBE: ${{ steps.transcribe.outcome }}
           PREPARE: ${{ steps.prepare.outcome }}
           CAPTURE: ${{ steps.capture.outcome }}
@@ -230,6 +246,7 @@ jobs:
           import os
           from pathlib import Path
           delivery = Path(os.environ.get("VRS_JOB", "/nonexistent")) / "delivery"
+          print(f"- Runner mode: `{os.environ.get('RUNNER_MODE', 'github-hosted')}`")
           for key, title in [
               ("TRANSCRIBE", "02 · Speech recognition and recovery"),
               ("PREPARE", "03–04 · Caption readiness, assets, composition and branding"),

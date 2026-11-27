@@ -35,7 +35,7 @@ DEPLOY = {WORKFLOW: APP_ROOT / WORKFLOW,
 STATE = CACHE / "cloud"
 API_VERSION = "X-GitHub-Api-Version: 2026-03-10"
 PRODUCTION_BLOCK = (
-    "GitHub-hosted production is disabled. Configure the verified private repository SHA and "
+    "GitHub-hosted production is disabled. Connect the designated private repository and "
     "scoped transfer credential, or choose explicit Local execution."
 )
 
