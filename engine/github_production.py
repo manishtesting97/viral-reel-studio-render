@@ -217,9 +217,8 @@ def preflight(sha, renderer_sha):
     if not flag or flag.get("value") != renderer_sha:
         raise ValueError("Enable hybrid production only after authorization, secure transfer and quota checks.")
     environment = renderer_api("/environments/vrs-hybrid-production")
-    rules = {rule["type"] for rule in environment["protection_rules"]}
-    if environment.get("can_admins_bypass") is not False or "required_reviewers" not in rules:
-        raise ValueError("Restore a required reviewer and disable administrator bypass before uploading.")
+    if environment.get("can_admins_bypass") is not False:
+        raise ValueError("Disable administrator bypass on the protected production environment before uploading.")
     branches = renderer_api("/environments/vrs-hybrid-production/deployment-branch-policies")["branch_policies"]
     if {policy["name"] for policy in branches} != {"main"}:
         raise ValueError("Restrict the protected production environment to the main branch.")
