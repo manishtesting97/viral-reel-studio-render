@@ -487,16 +487,16 @@ def merge_recovered_spans(base_tokens, base_words, recovered_tokens, *, is_witne
                 continue
         if is_witness:
             if not w.get("asrIndices"):
-                protected.append((round(w["start"], 4), round(w["end"], 4)))
+                protected.append((round(w["start"], 4), round(w["end"], 4), normalized(w["text"])))
         else:
             for idx in w.get("asrIndices", []):
                 if 0 <= idx < len(base_tokens):
                     tok = base_tokens[idx]
-                    protected.append((round(tok["start"], 4), round(tok["end"], 4)))
+                    protected.append((round(tok["start"], 4), round(tok["end"], 4), normalized(tok["text"])))
                     kept.append(tok)
     if is_witness:
         kept = [tok for tok in base_tokens
-                if any(min(tok["end"], pe) > max(tok["start"], ps) + 1e-4 for ps, pe in protected)
+                if any(min(tok["end"], pe) > max(tok["start"], ps) + 1e-4 for ps, pe, *_ in protected)
                 or tok.get("probability", 0) >= 0.70]
     # Preserve exact-English witness spans while allowing recovered Devanagari Hindi words to replace Hinglish witness substitutes.
     blocked_alt = [(round(w["start"], 4), round(w["end"], 4)) for w in base_words
@@ -506,9 +506,14 @@ def merge_recovered_spans(base_tokens, base_words, recovered_tokens, *, is_witne
     add = []
     for tok in recovered_tokens:
         ts, te = round(tok["start"], 4), round(tok["end"], 4)
-        for ps, pe in protected:
+        tnorm = normalized(tok["text"])
+        for ps, pe, pnorm in protected:
             if te <= ps + 1e-4 or ts >= pe - 1e-4:
                 continue
+            # Never split an already-protected matching token into a duplicate trailing fragment.
+            if pnorm and tnorm == pnorm:
+                te = ts
+                break
             # Trim small neighbor boundary overlaps without altering any verified protected span.
             if ts < ps <= te and (ps - ts) >= 0.04:
                 te = min(te, ps)
@@ -520,7 +525,7 @@ def merge_recovered_spans(base_tokens, base_words, recovered_tokens, *, is_witne
         ts, te = round(ts, 4), round(te, 4)
         if te - ts < 0.04:
             continue
-        if any(min(te, pe) > max(ts, ps) + 1e-4 for ps, pe in protected):
+        if any(min(te, pe) > max(ts, ps) + 1e-4 for ps, pe, *_ in protected):
             continue
         if any(min(te, ae) > max(ts, as_) + 1e-4 for as_, ae in blocked_alt):
             continue

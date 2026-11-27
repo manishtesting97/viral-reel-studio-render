@@ -24,6 +24,7 @@ LETTER_SOUNDS = dict(zip(
 _VARIANTS_RAW = {
     "kehte": ("kahte",), "keh": ("kah",), "hai": ("hain",), "nahi": ("nahin",), "zarurat": ("jarurat",),
     "zaroor": ("jarur",), "aur": ("or",), "mein": ("men", "main"), "ye": ("yah", "yeh"),
+    "toh": ("to",), "liye": ("lie",),
     "taiyaar": ("tayaar",), "sirf": ("sirph",),
     "goal": ("gol",), "plan": ("plaan",), "permission": ("parmishan", "paramishan"),
     "agent": ("ejent", "ajent", "ajant"), "research": ("risarch", "riserc"),
