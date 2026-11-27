@@ -220,15 +220,15 @@ def preflight(sha, renderer_sha):
     if {policy["name"] for policy in branches} != {"main"}:
         raise ValueError("Restrict the protected production environment to the main branch.")
     workload = renderer_api("/actions/variables/VRS_HYBRID_WORKLOAD", missing=True)
-    classification = (workload or {}).get("value")
+    classification, _, approved_sha = (workload or {}).get("value", "").partition(":")
     if classification == "content-production":
         raise ValueError("GitHub-hosted rendering is unavailable for routine reel production under the standard Actions terms. "
                          "Use explicit Local execution for this workload.")
     if classification not in {"software-project", "agreement-covered"}:
         raise ValueError("GitHub-hosted execution is disabled until this workload is classified under the applicable Actions terms.")
-    flag = renderer_api("/actions/variables/VRS_HYBRID_PRODUCTION_SHA", missing=True)
-    if not flag or flag.get("value") != renderer_sha:
-        raise ValueError("Hosted execution is disabled for this renderer SHA. Enable the verified pin after confirming secure transfer and the $0 spending block.")
+    if approved_sha != renderer_sha:
+        raise ValueError("The GitHub workload configuration does not pin this verified renderer SHA. "
+                         "Update the workload configuration after confirming secure transfer and the $0 spending block.")
     return branch, workflow["id"]
 
 

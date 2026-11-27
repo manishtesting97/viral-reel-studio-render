@@ -14,7 +14,14 @@ concurrency:
 jobs:
   render:
     name: Isolated production · setup through private delivery
-    if: github.repository == 'manishtesting97/viral-reel-studio-render' && !github.event.repository.private && github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && ((inputs.probe && github.sha == vars.VRS_HYBRID_PROBE_SHA) || (!inputs.probe && github.sha == vars.VRS_HYBRID_PRODUCTION_SHA && (vars.VRS_HYBRID_WORKLOAD == 'software-project' || vars.VRS_HYBRID_WORKLOAD == 'agreement-covered')))
+    if: >-
+      github.repository == 'manishtesting97/viral-reel-studio-render' &&
+      !github.event.repository.private && github.ref == 'refs/heads/main' &&
+      github.sha == inputs.expected_sha &&
+      ((inputs.probe && github.sha == vars.VRS_HYBRID_PROBE_SHA) ||
+       (!inputs.probe &&
+        (vars.VRS_HYBRID_WORKLOAD == format('software-project:{0}', github.sha) ||
+         vars.VRS_HYBRID_WORKLOAD == format('agreement-covered:{0}', github.sha))))
     environment: vrs-hybrid-production
     runs-on: ubuntu-22.04
     timeout-minutes: 30
