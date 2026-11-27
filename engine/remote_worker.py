@@ -364,7 +364,7 @@ def run_job(job):
             worker.finish(job,status)
 
 
-def execute(job, *, production_audio=False):
+def execute(job, *, production_audio=False, companion_dir=None):
     manifest=read(job/"manifest.json")
     folder=job/"input"
     env=runtime_env()
@@ -432,6 +432,33 @@ def execute(job, *, production_audio=False):
             voice_input = mixed
         args += ["-f", "wav", "-i", str(voice_input)]
     args+=["-map","0:v:0"]
+    if companion_dir is not None:
+        visual_only = companion_dir / "visual-only.mp4"
+        captioned_silent = companion_dir / "captioned-silent.mp4"
+        ffmpeg("-i", str(raw), "-map", "0:v:0", "-c:v", "copy", "-an",
+               "-t", duration, "-movflags", "+faststart", "-f", "mp4", str(visual_only))
+        raw.unlink(missing_ok=True)
+        if (folder / "captions.ass").is_file():
+            ffmpeg("-i", str(visual_only), "-vf", "ass=captions.ass:fontsdir=assets/brand-profile",
+                   "-map", "0:v:0", "-an", "-c:v", "libx264", "-crf", str(crf),
+                   "-preset", "fast", "-pix_fmt", "yuv420p", "-t", duration,
+                   "-movflags", "+faststart", "-f", "mp4", str(captioned_silent))
+        else:
+            shutil.copyfile(visual_only, captioned_silent)
+        if voice:
+            ffmpeg("-i", str(captioned_silent), "-f", "wav", "-i", str(voice_input),
+                   "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-af", "apad",
+                   "-c:a", "aac", "-ar", "48000", "-t", duration,
+                   "-movflags", "+faststart", "-f", "mp4", str(job / "result"))
+        else:
+            shutil.copyfile(captioned_silent, job / "result")
+        progress("verify", 5)
+        from production_render import verify
+        verify(visual_only, frames / fps, fps, preset, False)
+        verify(captioned_silent, frames / fps, fps, preset, False)
+        verify(job / "result", frames / fps, fps, preset, voice)
+        progress("verify", 100)
+        return
     if (folder/"captions.ass").is_file():
         args+=["-vf","ass=captions.ass:fontsdir=assets/brand-profile","-c:v","libx264","-crf",str(crf),
                "-preset","fast","-pix_fmt","yuv420p"]

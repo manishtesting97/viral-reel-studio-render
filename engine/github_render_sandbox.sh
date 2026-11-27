@@ -16,7 +16,17 @@ ffprobe=$(realpath "$(command -v ffprobe)")
 if [[ ${1:-} == probe ]]; then
   command=(/tools/node /engine/github_sandbox_probe.mjs)
 else
-  command=("$python" /engine/github_production.py render /job)
+  command=("$python" /engine/github_production.py execute /job)
+fi
+extra_binds=()
+if [[ -n ${VRS_MODEL_DIR:-} && -d ${VRS_MODEL_DIR} ]]; then
+  extra_binds=(
+    --ro-bind "$VRS_MODEL_DIR" /models
+    --setenv VRS_MODEL_DIR /models
+    --setenv HF_HUB_OFFLINE 1
+    --setenv HF_HUB_DISABLE_TELEMETRY 1
+    --setenv HF_HUB_DISABLE_IMPLICIT_TOKEN 1
+  )
 fi
 exec bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind /lib64 /lib64 \
@@ -29,4 +39,5 @@ exec bwrap --unshare-all --die-with-parent --new-session --clearenv \
   --setenv PATH /tools:/usr/bin --setenv HOME /tmp --setenv LANG C.UTF-8 \
   --ro-bind "$engine/github_render_sandbox.sh" /tools/vrs-chrome \
   --setenv VRS_REMOTE_BROWSER /tools/vrs-chrome \
+  "${extra_binds[@]}" \
   --chdir /job "${command[@]}"

@@ -1,0 +1,281 @@
+"""Narration-driven word-anchor resolver and declarative semantic storyboard compiler."""
+from __future__ import annotations
+
+import re
+
+SEMANTIC_ACTIONS = (
+    "reveal",
+    "type",
+    "click",
+    "drag",
+    "connect",
+    "count",
+    "highlight",
+    "transform",
+    "confirm",
+    "reject",
+    "restore",
+    "compare",
+    "exit",
+)
+
+_TOKEN_RE = re.compile(r"[^\W_][\w\u0900-\u097f']*", re.UNICODE)
+
+
+def _norm(token: str) -> str:
+    return re.sub(r"[^\w\u0900-\u097f]", "", (token or "").casefold())
+
+
+def _tokenize(text: str) -> list[str]:
+    return [_norm(m.group(0)) for m in _TOKEN_RE.finditer(text or "") if _norm(m.group(0))]
+
+
+def resolve_anchor_time(
+    anchors: str | list[str] | tuple[str, ...],
+    scene_words: list[dict],
+    narration: str,
+    scene_start: float,
+    scene_dur: float,
+    *,
+    fallback_ratio: float = 0.35,
+    after_rel: float = 0.0,
+) -> float:
+    """Resolve narration word/phrase anchor into scene-relative seconds [0.05, scene_dur - 0.20]."""
+    cands = [anchors] if isinstance(anchors, str) else list(anchors or [])
+    dur = max(0.6, float(scene_dur))
+    ceiling = max(0.18, dur - 0.22)
+    phrase_tokens_list = [_tokenize(c) for c in cands if c and _tokenize(c)]
+
+    if scene_words and phrase_tokens_list:
+        w_norms = [_norm(w.get("text", "")) for w in scene_words]
+        for ptoks in phrase_tokens_list:
+            plen = len(ptoks)
+            for idx in range(len(w_norms)):
+                t_rel = float(scene_words[idx].get("start", scene_start)) - float(scene_start)
+                if t_rel < after_rel - 0.04:
+                    continue
+                if w_norms[idx : idx + plen] == ptoks:
+                    return round(max(0.05, min(ceiling, t_rel)), 3)
+            # Single-token substring/stem match for inflection tolerance (e.g., repository/repositories, push/pushed)
+            head = ptoks[0]
+            if len(head) >= 4:
+                for idx, wn in enumerate(w_norms):
+                    t_rel = float(scene_words[idx].get("start", scene_start)) - float(scene_start)
+                    if t_rel >= after_rel - 0.04 and (head in wn or wn in head):
+                        return round(max(0.05, min(ceiling, t_rel)), 3)
+
+    # Fallback: proportional position inside narration script when timeline words are unavailable
+    narr_tokens = _tokenize(narration)
+    if narr_tokens and phrase_tokens_list:
+        total = max(1, len(narr_tokens))
+        for ptoks in phrase_tokens_list:
+            head = ptoks[0]
+            for idx, nt in enumerate(narr_tokens):
+                est = (idx / total) * dur
+                if est >= after_rel and (nt == head or (len(head) >= 4 and (head in nt or nt in head))):
+                    return round(max(0.05, min(ceiling, est)), 3)
+
+    base = max(after_rel + 0.12, fallback_ratio * dur)
+    return round(max(0.05, min(ceiling, base)), 3)
+
+
+def compile_scene_storyboard(
+    scene: dict,
+    component: str,
+    scene_words: list[dict],
+    scene_start: float,
+    scene_dur: float,
+    brief: dict | None = None,
+    assignment: dict | None = None,
+) -> dict:
+    """Build deterministic scene storyboard and word-anchored event timings for any niche."""
+    explicit = scene.get("storyboard") if isinstance(scene.get("storyboard"), dict) else {}
+    narr = scene.get("narration") or ""
+    desc = scene.get("visual", {}).get("description") or ""
+    heading = scene.get("heading") or scene.get("id", "scene")
+    anim = scene.get("animation") or []
+
+    def anchor(cands, ratio, min_after=0.0):
+        return resolve_anchor_time(cands, scene_words, narr, scene_start, scene_dur, fallback_ratio=ratio, after_rel=min_after)
+
+    t_first = round(min(0.28, scene_dur * 0.08), 3)
+    t_mid_early = anchor(["github", "version", "control", "feature", "computer", "platform", "team", "commit", "step", "email", "search", "folder", "code"], 0.18, min_after=0.12)
+    t_mid = anchor(["connection", "changes", "history", "bigad", "broken", "error", "internet", "offline", "host", "repositories", "review", "local", "hosting", "track", "verify", "score"], 0.44, min_after=max(0.35, t_mid_early + 0.2))
+    t_late = anchor(["alag", "wapas", "restore", "undo", "account", "share", "merge", "push", "bhej", "collaboration", "follow", "export", "csv", "dm", "comment"], 0.72, min_after=max(0.65, t_mid + 0.2))
+
+    # Build resolved explicit events first if provided by plan author / ChatGPT
+    resolved_events: list[dict] = []
+    if explicit.get("events"):
+        for ev in explicit["events"]:
+            action = ev.get("action", "reveal")
+            if action not in SEMANTIC_ACTIONS:
+                action = "reveal"
+            if "at" in ev and ev["at"] is not None:
+                at_s = round(max(0.04, min(scene_dur - 0.15, float(ev["at"]))), 3)
+            elif ev.get("anchor"):
+                at_s = anchor(ev["anchor"], 0.35)
+            else:
+                at_s = t_mid
+            resolved_events.append({
+                "action": action,
+                "target": ev.get("target", "primary"),
+                "anchor": ev.get("anchor", ""),
+                "at": at_s,
+                "duration": round(float(ev.get("duration") or 0.42), 3),
+                **({"value": ev["value"]} if "value" in ev else {}),
+            })
+    else:
+        # Synthesize narration-driven semantic motion sequence per component type
+        comp_events = _default_component_events(component, narr, desc, scene_dur, anchor, t_first, t_mid, t_late)
+        resolved_events.extend(comp_events)
+
+    return {
+        "purpose": explicit.get("purpose") or f"Illustrate {heading} synchronized with narration",
+        "composition": explicit.get("composition") or component,
+        "entities": explicit.get("entities") or _extract_entities(heading, desc, brief),
+        "elements": explicit.get("elements") or [],
+        "events": resolved_events,
+        "cues": {
+            "t_first": t_first,
+            "t_early": t_mid_early,
+            "t_mid": t_mid,
+            "t_late": t_late,
+            "t_exit": round(max(t_late + 0.2, scene_dur - 0.16), 3),
+        },
+        "transitionIntent": explicit.get("transitionIntent") or scene.get("visual", {}).get("transition", "smooth-editorial"),
+        "stylingEmphasis": explicit.get("stylingEmphasis") or (brief.get("style", "editorial-motion") if brief else "editorial-motion"),
+        "assignedAssets": explicit.get("assignedAssets") or [layer.get("assetId", "") for layer in (assignment or {}).get("layers", []) if layer.get("assetId")],
+    }
+
+
+def _extract_entities(heading: str, desc: str, brief: dict | None) -> list[str]:
+    found = []
+    for m in re.finditer(r"\b[A-Z][A-Za-z0-9.+#/-]{1,24}\b", f"{heading} {desc}"):
+        w = m.group(0)
+        if w not in found and w.lower() not in {"the", "and", "for", "with"}:
+            found.append(w)
+        if len(found) >= 6:
+            break
+    if not found and brief and brief.get("topic"):
+        found.append(str(brief["topic"])[:40])
+    return found
+
+
+def _default_component_events(component, narr, desc, dur, anchor, t_first, t_mid, t_late):
+    if component == "comparison_split":
+        t_left = anchor(["git", "first", "local", "old", "before", "others"], 0.04)
+        t_right = anchor(["github", "second", "cloud", "new", "after", "platform"], 0.20, min_after=t_left + 0.25)
+        t_clash = anchor(["same", "nahi", "not", "different", "alag", "never", "vs"], 0.28, min_after=t_right + 0.25)
+        t_conn = anchor(["dono", "connection", "connect", "bridge", "both", "tool", "aur"], 0.48, min_after=t_clash + 0.35)
+        t_benefit = anchor(["easy", "simple", "fast", "clear", "benefit", "collaboration", "helpful"], 0.76, min_after=t_conn + 0.35)
+        if dur >= 3.0:
+            t_benefit = round(min(t_benefit, dur - 1.05), 3)
+        return [
+            {"action": "reveal", "target": "left-card", "anchor": "primary-subject", "at": t_left, "duration": 0.34},
+            {"action": "compare", "target": "right-card", "anchor": "secondary-subject", "at": t_right, "duration": 0.34},
+            {"action": "confirm", "target": "verdict-stamp", "anchor": "contrast", "at": t_clash, "duration": 0.36},
+            {"action": "connect", "target": "bridge-connector", "anchor": "connection", "at": t_conn, "duration": 0.65},
+            {"action": "highlight", "target": "benefit-pill", "anchor": "outcome", "at": t_benefit, "duration": 0.34},
+        ]
+    if component in ("editor_history", "three_workstation"):
+        t_ed = round(min(anchor(["git", "editor", "file", "version"], 0.08), 0.35), 3)
+        t_diff = anchor(["code", "changes", "feature", "edit", "track"], 0.36, min_after=t_ed + 0.25)
+        t_hist = anchor(["history", "track", "commit", "snapshot", "save"], 0.62, min_after=t_diff + 0.2)
+        return [
+            {"action": "reveal", "target": "editor-window", "anchor": "editor", "at": t_ed, "duration": 0.38},
+            {"action": "type", "target": "code-change", "anchor": "changes", "at": t_diff, "duration": 0.55},
+            {"action": "highlight", "target": "history-commits", "anchor": "history", "at": t_hist, "duration": 0.55},
+        ]
+    if component == "history_snapshots":
+        t_feat = anchor(["feature", "banaya", "code", "v2"], 0.14)
+        t_err = anchor(["bigad", "broken", "error", "bug", "fail"], 0.46, min_after=t_feat + 0.3)
+        t_hist = anchor(["git", "history", "log", "versions"], 0.58, min_after=t_err + 0.25)
+        t_pick = anchor(["purane", "version", "v1", "old"], 0.70, min_after=t_hist + 0.25)
+        t_rest = anchor(["wapas", "restore", "undo", "recover"], 0.82, min_after=t_pick + 0.25)
+        return [
+            {"action": "type", "target": "v2-feature", "anchor": "feature", "at": t_feat, "duration": 0.42},
+            {"action": "reject", "target": "v3-broken", "anchor": "error", "at": t_err, "duration": 0.40},
+            {"action": "reveal", "target": "history-drawer", "anchor": "history", "at": t_hist, "duration": 0.36},
+            {"action": "click", "target": "cursor-select-v1", "anchor": "version", "at": t_pick, "duration": 0.42},
+            {"action": "restore", "target": "rollback-arc", "anchor": "restore", "at": t_rest, "duration": 0.55},
+        ]
+    if component in ("offline_workflow", "three_node_offline"):
+        t_comp = round(min(anchor(["git", "computer", "laptop", "workstation"], 0.08), 0.35), 3)
+        t_off = anchor(["bina internet", "without internet", "internet", "offline", "wifi"], 0.38, min_after=t_comp + 0.2)
+        t_work = anchor(["kaam", "works", "work", "save", "commit"], 0.58, min_after=t_off + 0.25)
+        t_acct = anchor(["account", "github", "zaroori nahi", "optional"], 0.76, min_after=t_work + 0.25)
+        return [
+            {"action": "reveal", "target": "local-machine", "anchor": "computer", "at": t_comp, "duration": 0.36},
+            {"action": "transform", "target": "wifi-toggle-off", "anchor": "offline", "at": t_off, "duration": 0.34},
+            {"action": "confirm", "target": "local-save-ok", "anchor": "commit", "at": t_work, "duration": 0.38},
+            {"action": "highlight", "target": "optional-account", "anchor": "account", "at": t_acct, "duration": 0.34},
+        ]
+    if component == "platform_browser":
+        t_open = anchor(["github", "platform", "website", "dashboard", "browser"], 0.10)
+        t_host = anchor(["repositories", "host", "files", "code"], 0.48, min_after=t_open + 0.3)
+        t_share = anchor(["share", "link", "invite", "public"], 0.75, min_after=t_host + 0.3)
+        return [
+            {"action": "reveal", "target": "browser-window", "anchor": "platform", "at": t_open, "duration": 0.38},
+            {"action": "reveal", "target": "repo-files", "anchor": "host", "at": t_host, "duration": 0.45},
+            {"action": "click", "target": "share-button", "anchor": "share", "at": t_share, "duration": 0.45},
+        ]
+    if component == "collaboration_network":
+        t_team = anchor(["team", "developers", "contributors"], 0.08)
+        t_rev = anchor(["review", "code review", "changes", "diff"], 0.32, min_after=t_team + 0.25)
+        t_merge = anchor(["merge", "pull request", "github", "sync"], 0.68, min_after=t_rev + 0.3)
+        return [
+            {"action": "reveal", "target": "contributor-nodes", "anchor": "team", "at": t_team, "duration": 0.38},
+            {"action": "connect", "target": "branch-review", "anchor": "review", "at": t_rev, "duration": 0.55},
+            {"action": "click", "target": "merge-pr-btn", "anchor": "merge", "at": t_merge, "duration": 0.50},
+        ]
+    if component == "terminal_pipeline":
+        t_commit = anchor(["commit", "changes", "add"], 0.22)
+        t_local = anchor(["local", "history", "save"], 0.40, min_after=t_commit + 0.2)
+        t_push = anchor(["push", "git push"], 0.64, min_after=t_local + 0.25)
+        t_xfer = anchor(["commits", "bhej", "remote", "transfer", "upload"], 0.72, min_after=t_push + 0.20)
+        t_remote = anchor(["github", "online", "live", "synced"], 0.82, min_after=t_xfer + 0.20)
+        return [
+            {"action": "type", "target": "cmd-commit", "anchor": "commit", "at": t_commit, "duration": 0.46},
+            {"action": "confirm", "target": "local-repo-card", "anchor": "local", "at": t_local, "duration": 0.40},
+            {"action": "type", "target": "cmd-push", "anchor": "push", "at": t_push, "duration": 0.46},
+            {"action": "connect", "target": "push-transfer-arc", "anchor": "transfer", "at": t_xfer, "duration": 0.70},
+            {"action": "confirm", "target": "remote-sync-confirm", "anchor": "github", "at": t_remote, "duration": 0.38},
+        ]
+    if component == "folder_workspace":
+        t_drop = anchor(["folder", "project", "workspace", "drop"], 0.14)
+        t_sub = anchor(["footage", "assets", "style", "export", "files", "ready"], 0.48, min_after=t_drop + 0.25)
+        t_done = anchor(["organize", "done", "clean", "start"], 0.76, min_after=t_sub + 0.25)
+        return [
+            {"action": "reveal", "target": "dropzone-card", "anchor": "folder", "at": t_drop, "duration": 0.36},
+            {"action": "click", "target": "folder-expand-btn", "anchor": "files", "at": t_sub, "duration": 0.42},
+            {"action": "confirm", "target": "workspace-tree", "anchor": "ready", "at": t_done, "duration": 0.38},
+        ]
+    if component == "search_serp":
+        t_q = anchor(["search", "google", "website", "query", "keyword"], 0.14)
+        t_rows = anchor(["result", "page", "rank", "top"], 0.44, min_after=t_q + 0.25)
+        t_verdict = anchor(["not found", "missing", "rank", "found", "zero"], 0.72, min_after=t_rows + 0.25)
+        return [
+            {"action": "type", "target": "search-query", "anchor": "search", "at": t_q, "duration": 0.55},
+            {"action": "reveal", "target": "serp-results", "anchor": "result", "at": t_rows, "duration": 0.40},
+            {"action": "reject" if any(k in f"{narr} {desc}".lower() for k in ("not found", "missing", "hide", "lose")) else "confirm", "target": "serp-stamp", "anchor": "verdict", "at": t_verdict, "duration": 0.36},
+        ]
+    if component == "metric_showcase":
+        t_kpi = anchor(["percent", "%", "score", "rate", "metric", "ratio"], 0.16)
+        t_bar = anchor(["target", "goal", "benchmark", "growth", "impact"], 0.48, min_after=t_kpi + 0.25)
+        t_check = anchor(["verified", "result", "total", "ready"], 0.74, min_after=t_bar + 0.25)
+        return [
+            {"action": "count", "target": "metric-kpi-1", "anchor": "metric", "at": t_kpi, "duration": 0.75},
+            {"action": "count", "target": "metric-gauge", "anchor": "target", "at": t_bar, "duration": 0.85},
+            {"action": "confirm", "target": "metric-stamp", "anchor": "verified", "at": t_check, "duration": 0.34},
+        ]
+    if component == "creator_cta_outro":
+        t_cta = anchor(["follow", "subscribe", "comment", "save", "dm"], 0.65, min_after=0.35)
+        return [
+            {"action": "reveal", "target": "creator-profile", "anchor": "intro", "at": t_first, "duration": 0.38},
+            {"action": "click", "target": "follow-cta", "anchor": "follow", "at": t_cta, "duration": 0.45},
+        ]
+    return [
+        {"action": "reveal", "target": "stage-primary", "anchor": "start", "at": t_first, "duration": 0.38},
+        {"action": "highlight", "target": "stage-detail", "anchor": "middle", "at": t_mid, "duration": 0.42},
+        {"action": "confirm", "target": "stage-finish", "anchor": "end", "at": t_late, "duration": 0.36},
+    ]

@@ -323,6 +323,29 @@ def near(left, right, multilingual):
     cross = multilingual and (bool(DEVANAGARI.search(a_raw)) != bool(DEVANAGARI.search(b_raw)))
     left_set = pronunciations(left) | (english_phonetic_keys(left) if cross and not DEVANAGARI.search(a_raw) else frozenset()) if multilingual else {a_raw}
     right_set = pronunciations(right) | (english_phonetic_keys(right) if cross and not DEVANAGARI.search(b_raw) else frozenset()) if multilingual else {b_raw}
+    if cross:
+        raw = a_raw if not DEVANAGARI.search(a_raw) else b_raw
+        pronounced = re.sub(r"^(?:k(?=n)|g(?=n)|w(?=r))", "", raw)
+        if pronounced != raw:
+            variants = english_phonetic_keys(pronounced)
+            if raw == a_raw:
+                left_set |= variants
+            else:
+                right_set |= variants
+
+    def review_keys(keys):
+        # Conservative additional spellings, used only for contextual review matches.
+        for key in keys:
+            if len(key) < 4 or not key.isascii():
+                continue
+            key = re.sub(r"^(?:kn|gn)", "n", key)
+            key = re.sub(r"^wr", "r", key)
+            key = re.sub(r"mb$", "m", key)
+            key = re.sub(r"(?:ng|ny|m)(?=[kgjcpb])", "n", key)
+            yield key
+
+    if set(review_keys(left_set)) & set(review_keys(right_set)):
+        return True
     for a in left_set:
         for b in right_set:
             if not a or not b:

@@ -293,13 +293,45 @@ def witness_windows(report, duration):
     return merged[:3]
 
 
-def align(project, plan, model_name=None, *, remote_words=None):
+def whisper_model_name(language, models_dir=MODELS):
+    if language == "en":
+        return "tiny.en"
+    return "tiny" if (models_dir / "models--Systran--faster-whisper-tiny/refs/main").is_file() else "small"
+
+
+def load_whisper_model(model_name, models_dir=MODELS):
+    os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    from faster_whisper import WhisperModel
+
+    return WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=2,
+                        download_root=str(models_dir), local_files_only=True)
+
+
+def run_whisper(model, source, language, *, offset=0.0, **options):
+    segments, info = model.transcribe(source if not isinstance(source, Path) else str(source),
+                                      language=language, word_timestamps=True, **options)
+    words = []
+    for segment in segments:
+        for word in segment.words:
+            text = word.word.strip()
+            start, end = float(word.start + offset), float(word.end + offset)
+            if normalized(text) and math.isfinite(start) and math.isfinite(end) and 0 <= start < end:
+                if words and start < words[-1]["end"]:
+                    continue
+                words.append({"text": text, "start": start, "end": end,
+                              "probability": float(word.probability)})
+    metadata = {"configuredLanguage": language or "auto", "language": info.language,
+                "languageProbability": float(info.language_probability)}
+    return words, metadata
+
+
+def align(project, plan, model_name=None, *, remote_words=None, remote_recognition=None, remote_alternate=None):
     for scene in plan["scenes"]:
         validate_scene(scene)
     voice = project / "voice.wav"
-    model_name = model_name or ("tiny.en" if plan["language"] == "en" else
-                                "tiny" if (MODELS / "models--Systran--faster-whisper-tiny/refs/main").is_file()
-                                else "small")
+    model_name = model_name or whisper_model_name(plan["language"], MODELS)
     key = digest(voice, plan["language"], model_name)
     transcript = project / f".whisper-{key}.json"
     report_path = project / "alignment-report.json"
@@ -312,32 +344,22 @@ def align(project, plan, model_name=None, *, remote_words=None):
 
     def recognize(language, *, samples=None, offset=0, override_model=None, **options):
         nonlocal model
-        os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-        os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
-        from faster_whisper import WhisperModel
-
         if override_model and override_model != model_name:
             # Free primary model first on memory-constrained CPUs before loading fast witness model.
             model = None
-            target = WhisperModel(override_model, device="cpu", compute_type="int8", cpu_threads=2,
-                                  download_root=str(MODELS), local_files_only=True)
+            target = load_whisper_model(override_model, MODELS)
         else:
             if model is None:
-                model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=2,
-                                     download_root=str(MODELS), local_files_only=True)
+                model = load_whisper_model(model_name, MODELS)
             target = model
-        segments, info = target.transcribe(str(voice) if samples is None else samples, language=language,
-                                           word_timestamps=True, **options)
-        return ([{"text": word.word.strip(), "start": word.start + offset, "end": word.end + offset,
-                  "probability": word.probability} for segment in segments
-                 for word in segment.words if normalized(word.word)],
-                {"configuredLanguage": language or "auto", "language": info.language,
-                 "languageProbability": info.language_probability})
+        return run_whisper(target, voice if samples is None else samples, language, offset=offset, **options)
 
     t_align_start = time.perf_counter()
     primary_transcribe_s = 0.0
     witness_transcribe_s = 0.0
     info_path = project / f".whisper-{key}-recognition.json"
+    if remote_recognition is not None:
+        save(info_path, remote_recognition)
     if not transcript.is_file():
         alignment_stage("Transcribing local audio", 10)
         t_p0 = time.perf_counter()
@@ -363,17 +385,25 @@ def align(project, plan, model_name=None, *, remote_words=None):
             report["segmentRetry"] = {"cache": retry_path.name, "clip": retry["clip"], "replace": retry["replace"],
                                       "rawCache": transcript.name, "method": retry.get("method")}
     has_tiny_en = (MODELS / "models--Systran--faster-whisper-tiny.en/refs/main").is_file()
-    if (plan["language"] == "hinglish" and model_name != "tiny.en" and remote_words is None
+    if (plan["language"] == "hinglish" and model_name != "tiny.en"
+            and (remote_words is None or remote_alternate is not None)
             and duration <= 180 and (report["reliableCoverage"] < QUALITY_FLOOR or report["unmatched"])
             and any(DEVANAGARI.search(w["text"]) for w in observed)):
-        use_tiny_en = has_tiny_en
+        use_tiny_en = has_tiny_en or remote_alternate is not None
         windows = [(0, duration)] if (use_tiny_en or duration <= 12) else witness_windows(report, duration)
         suffix = ("tiny-en-witness-v2" if use_tiny_en
                   else "english-witness-v1" if duration <= 12
                   else f"english-windows-v1-{digest(windows)}")
         alternate_path = project / f".whisper-{key}-{suffix}.json"
         try:
-            if not alternate_path.is_file():
+            if remote_alternate is not None:
+                save(alternate_path, {
+                    "words": remote_alternate["words"],
+                    "recognition": remote_alternate.get("recognition", {"witnessModel": "tiny.en"}),
+                    "windows": windows,
+                    "prompted": False,
+                })
+            elif not alternate_path.is_file():
                 alignment_stage("Checking measured code-switch gaps with independent ASR", 72)
                 t_w0 = time.perf_counter()
                 options = {"beam_size": 3, "condition_on_previous_text": False}
@@ -458,8 +488,18 @@ def align(project, plan, model_name=None, *, remote_words=None):
     if failure:
         save(report_path, {**report, "status":"failed", "failureReason":failure})
         raise ValueError(failure)
-    starts = [word["start"] for word in anchors]
     alignment_stage("Saving measured scene and caption timing", 90)
+    timeline = measured_timeline(plan, duration, words, identity["timingKey"])
+    save(project / "timeline.json", timeline)
+    save(report_path, {**report, "status":"passed"})
+    return timeline
+
+
+def measured_timeline(plan, duration, words, key):
+    openings = {}
+    for word in words:
+        openings.setdefault(word["scene"], word["start"])
+    starts = [openings[scene["id"]] for scene in plan["scenes"]]
     starts[0] = 0
     total = duration + plan["outro"]
     scenes = []
@@ -472,8 +512,5 @@ def align(project, plan, model_name=None, *, remote_words=None):
                                      for a in scene["animation"]],
                        "audio_cues": [{**c, "at": start + c["at"] * scale}
                                       for c in scene["audio_cues"]]})
-    timeline = {"version": 1, "key": identity["timingKey"], "voiceDuration": duration,
-                "duration": total, "scenes": scenes, "words": words}
-    save(project / "timeline.json", timeline)
-    save(report_path, {**report, "status":"passed"})
-    return timeline
+    return {"version": 1, "key": key, "voiceDuration": duration,
+            "duration": total, "scenes": scenes, "words": words}

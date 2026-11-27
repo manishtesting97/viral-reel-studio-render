@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "python": "3.12",
+  "node": "22.23.5",
+  "npmMajor": 10,
+  "ffmpegMinimum": "6.1",
+  "models": {
+    "tiny.en": "0d3d19a32d3338f10357c0889762bd8d64bbdeba",
+    "small": "536b0662742c02347bc0e980a01041f333bce120"
+  }
+}

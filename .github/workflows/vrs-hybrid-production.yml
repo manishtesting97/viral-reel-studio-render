@@ -62,6 +62,37 @@ jobs:
           ffmpeg -hide_banner -encoders | grep -w libx264
           ffmpeg -hide_banner -encoders | grep -w aac
           printf 'VRS_JOB=%s/vrs-hybrid-job\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - name: Install pinned transcription runtime and offline Whisper models
+        if: ${{ !inputs.probe }}
+        run: |
+          umask 077
+          python3 -m pip install --no-cache-dir -r installers/python.lock.txt
+          models="$RUNNER_TEMP/vrs-models"
+          mkdir -p "$models"
+          python3 - "$models" <<'EOF'
+          import json
+          import sys
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+
+          models_dir = Path(sys.argv[1])
+          lock = json.loads(Path("installers/runtime.lock.json").read_text(encoding="utf-8"))
+          for name, revision in lock["models"].items():
+              path = Path(snapshot_download(
+                  "Systran/faster-whisper-" + name,
+                  revision=revision,
+                  cache_dir=str(models_dir),
+                  allow_patterns=["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "vocabulary.txt"],
+              ))
+              ref = path.parent.parent / "refs" / "main"
+              ref.parent.mkdir(exist_ok=True)
+              tmp = ref.with_suffix(".tmp")
+              tmp.write_text(path.name, encoding="utf-8")
+              tmp.replace(ref)
+              for required in ("model.bin", "config.json", "tokenizer.json"):
+                  assert (path / required).is_file() and (path / required).stat().st_size > 0
+          EOF
+          printf 'VRS_MODEL_DIR=%s\n' "$models" >> "$GITHUB_ENV"
       - name: Verify offline namespace and sandboxed Chrome without media
         run: |
           umask 077
@@ -78,12 +109,12 @@ jobs:
           umask 077
           python3 engine/github_production.py fetch "$VRS_JOB" "$REQUEST" >/dev/null 2>&1 ||
             { echo 'Private input verification failed'; exit 1; }
-      - name: Capture, encode and verify offline
+      - name: Process private job offline
         if: ${{ !inputs.probe }}
         run: |
           umask 077
           bash engine/github_render_sandbox.sh >/dev/null 2>&1 ||
-            { echo 'Isolated capture or encoding failed'; exit 1; }
+            { echo 'Isolated offline execution failed'; exit 1; }
       - name: Return verified output to private storage
         if: ${{ !inputs.probe }}
         env:

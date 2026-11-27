@@ -90,6 +90,15 @@ def validate(manifest, limit):
         if any(name not in {"index.html", "voice.wav", "captions.ass"} and not name.startswith("assets/")
                for name in files):
             raise ValueError("Unexpected render file.")
+    elif op == "prepare":
+        if preset is not None or language is not None:
+            raise ValueError("Invalid scene preparation inputs.")
+        if not any(re.fullmatch(r"projects/[A-Za-z0-9_.-]+/plan\.json", name) for name in files):
+            raise ValueError("Invalid scene preparation inputs.")
+        if any(not (name.startswith("projects/") or name.startswith("brand-profiles/")
+                    or name.startswith("style-library/") or name.startswith("assets/"))
+               for name in files):
+            raise ValueError("Unexpected scene preparation file.")
     else:
         raise ValueError("Unsupported operation.")
 
@@ -147,16 +156,29 @@ def copy_pipe(src, dest, limit, timeout, progress=None):
 
 
 def write_package(output, root, operation, revision, limit, preset=None, language=None):
-    names = ["voice.wav"] if operation == "transcribe" else ["index.html", "voice.wav", "captions.ass"]
-    if operation == "render":
-        assets = root / "assets"
-        if assets.is_symlink():
-            raise ValueError("Assets must not be symlinked.")
-        for path in assets.rglob("*"):
-            if path.is_symlink() or not (path.is_file() or path.is_dir()):
-                raise ValueError("Assets must be regular files or directories.")
-            if path.is_file():
-                names.append(path.relative_to(root).as_posix())
+    if operation == "prepare":
+        names = []
+        for top in ("projects", "brand-profiles", "style-library", "assets"):
+            base = root / top
+            if base.is_symlink():
+                raise ValueError("Inputs must not be symlinked.")
+            if base.is_dir():
+                for path in base.rglob("*"):
+                    if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                        raise ValueError("Preparation inputs must be regular files or directories.")
+                    if path.is_file():
+                        names.append(path.relative_to(root).as_posix())
+    else:
+        names = ["voice.wav"] if operation == "transcribe" else ["index.html", "voice.wav", "captions.ass"]
+        if operation == "render":
+            assets = root / "assets"
+            if assets.is_symlink():
+                raise ValueError("Assets must not be symlinked.")
+            for path in assets.rglob("*"):
+                if path.is_symlink() or not (path.is_file() or path.is_dir()):
+                    raise ValueError("Assets must be regular files or directories.")
+                if path.is_file():
+                    names.append(path.relative_to(root).as_posix())
     files = {}
     for name in sorted(names):
         path = root / name
