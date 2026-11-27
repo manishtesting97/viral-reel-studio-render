@@ -21,7 +21,7 @@ LETTER_SOUNDS = dict(zip(
 ))
 # Common Hindi romanizations and English loan pronunciations. These are word
 # equivalences; broad consonant replacement would merge unrelated short words.
-VARIANTS = {
+_VARIANTS_RAW = {
     "kehte": ("kahte",), "keh": ("kah",), "hai": ("hain",), "nahi": ("nahin",), "zarurat": ("jarurat",),
     "zaroor": ("jarur",), "aur": ("or",), "mein": ("men", "main"), "ye": ("yah", "yeh"),
     "taiyaar": ("tayaar",), "sirf": ("sirph",),
@@ -34,6 +34,11 @@ VARIANTS = {
     "result": ("rijalt", "rizalt"), "tool": ("tul",), "tools": ("tuls", "tulz"),
     "check": ("chek",), "use": ("yuz", "yuj"), "important": ("importent",),
 }
+VARIANTS = {}
+for _k, _vals in _VARIANTS_RAW.items():
+    _group = (_k, *_vals)
+    for _item in _group:
+        VARIANTS[_item] = tuple(dict.fromkeys((*VARIANTS.get(_item, ()), *(x for x in _group if x != _item))))
 # Attested Devanagari spellings; do not equate unrelated Latin spellings.
 DEVANAGARI_VARIANTS = {"plan": {"प्लैन"}, "jawab": {"जबाब"}, "waqt": {"वक्त", "वक़्त"}}
 # English plurals may have ambiguous ASR boundaries. They are review matches,

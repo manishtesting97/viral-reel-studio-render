@@ -168,10 +168,31 @@ def caption_state(project, plan, timeline, report, mutation=None):
             if failed else digest(timeline, report))
     path = project / "caption-corrections.json"
     state = load(path) if path.is_file() else {}
-    edits = state.get("edits", {}) if state.get("base") == base else {}
-    revision = digest(base, edits, windows)
     targets = {**missing, **review}
     scenes = {s["id"]: s for s in timeline["scenes"]}
+    if state.get("base") == base:
+        edits = dict(state.get("edits", {}))
+    elif state.get("timingKey") in {None, report.get("timingKey")} and isinstance(state.get("edits"), dict):
+        # Preserve still-valid manual edits matching script identity across recovery retries/restarts.
+        edits = {}
+        for k, v in state["edits"].items():
+            try:
+                i = int(k)
+            except (TypeError, ValueError):
+                continue
+            if i not in targets or not isinstance(v, dict):
+                continue
+            if (v.get("scene") is not None and v["scene"] != script[i][0]) or (
+                    v.get("text") is not None and v["text"] != script[i][1]):
+                continue
+            s_val, e_val = v.get("start"), v.get("end")
+            scene = scenes.get(targets[i]["scene"], {"start": 0, "end": timeline["voiceDuration"]})
+            if (all(type(n) in (int, float) and math.isfinite(n) for n in (s_val, e_val))
+                    and scene["start"] <= s_val < e_val <= min(scene["end"], timeline["voiceDuration"])):
+                edits[str(i)] = v
+    else:
+        edits = {}
+    revision = digest(base, edits, windows)
     original_words = words.copy()
 
     def apply(i, start, end):
@@ -190,20 +211,47 @@ def caption_state(project, plan, timeline, report, mutation=None):
     if mutation is not None:
         if mutation.get("revision") != revision:
             raise ValueError("Caption review changed. Reload this step before saving.")
-        index = mutation.get("index")
-        if type(index) is not int or index not in targets:
-            raise ValueError("Unknown caption review item.")
         action = mutation.get("action")
-        if action == "undo":
-            if edits.pop(str(index), None) is None:
-                raise ValueError("There is no manual correction to undo.")
-        elif action == "save" and mutation.get("accepted") is True:
-            start,end = mutation.get("start"),mutation.get("end")
-            if any(type(n) not in (int,float) or not math.isfinite(n) for n in (start,end)):
-                raise ValueError("Enter finite start and end times in seconds.")
-            edits[str(index)] = {"start":start,"end":end}
+        if action == "bulk_accept":
+            if mutation.get("accepted") is not True:
+                raise ValueError("Listen and confirm before bulk-accepting measured timing suggestions.")
+            items = mutation.get("items")
+            if not isinstance(items, list) or not items or len(items) > len(targets):
+                raise ValueError("Select at least one valid measured timing suggestion.")
+            seen_bulk = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError("Invalid bulk acceptance entry.")
+                idx = item.get("index")
+                if type(idx) is not int or idx not in targets or idx in seen_bulk:
+                    raise ValueError("Unknown or duplicate bulk caption review entry.")
+                seen_bulk.add(idx)
+                start, end = item.get("start"), item.get("end")
+                if any(type(n) not in (int, float) or not math.isfinite(n) for n in (start, end)) or not start < end:
+                    raise ValueError("Measured timing suggestions require valid start and end times.")
+                if idx in review:
+                    cand = review[idx]
+                elif isinstance(missing.get(idx, {}).get("candidate"), dict):
+                    cand = missing[idx]["candidate"]
+                else:
+                    raise ValueError("Only entries with valid measured timing suggestions can be bulk-accepted.")
+                if abs(cand["start"] - start) > 1e-4 or abs(cand["end"] - end) > 1e-4:
+                    raise ValueError("Submitted interval does not match the measured suggestion.")
+                edits[str(idx)] = {"start": start, "end": end, "scene": script[idx][0], "text": script[idx][1]}
         else:
-            raise ValueError("Listen and accept this timing before saving.")
+            index = mutation.get("index")
+            if type(index) is not int or index not in targets:
+                raise ValueError("Unknown caption review item.")
+            if action == "undo":
+                if edits.pop(str(index), None) is None:
+                    raise ValueError("There is no manual correction to undo.")
+            elif action == "save" and mutation.get("accepted") is True:
+                start,end = mutation.get("start"),mutation.get("end")
+                if any(type(n) not in (int,float) or not math.isfinite(n) for n in (start,end)):
+                    raise ValueError("Enter finite start and end times in seconds.")
+                edits[str(index)] = {"start": start, "end": end, "scene": script[index][0], "text": script[index][1]}
+            else:
+                raise ValueError("Listen and accept this timing before saving.")
     # Evaluate the final track in timestamp order to permit neighbouring manual edits without
     # validating a changed interval against a neighbour's obsolete base position.
     if edits:
@@ -219,18 +267,38 @@ def caption_state(project, plan, timeline, report, mutation=None):
                 words[i] = original
             apply(i, values["start"],values["end"])
     if mutation is not None:
-        save(path, {"base":base,"edits":edits})
+        save(path, {"base": base, "timingKey": report.get("timingKey"), "edits": edits})
         revision = digest(base,edits,windows)
 
     unresolved = [{**item,"scriptIndex":i} for i,item in missing.items() if i not in words]
     reviewed = [{**item,"scriptIndex":i} for i,item in review.items() if str(i) not in edits]
     ordered = [w for _,w in sorted(words.items())]
     remaining_openings = sorted(opening_reviews - {int(i) for i in edits})
+    def _is_valid_suggestion(i, cand):
+        if not isinstance(cand, dict):
+            return False
+        cs, ce = cand.get("start"), cand.get("end")
+        if any(type(n) not in (int, float) or not math.isfinite(n) for n in (cs, ce)) or not cs < ce:
+            return False
+        prev_e = max((w["end"] for j, w in words.items() if j < i), default=0)
+        next_s = min((w["start"] for j, w in words.items() if j > i), default=timeline["voiceDuration"])
+        sc = scenes.get(script[i][0], {"start": 0, "end": timeline["voiceDuration"]})
+        return max(prev_e, sc["start"]) <= cs < ce <= min(next_s, sc["end"], timeline["voiceDuration"])
+
+    suggested_ids = sorted(
+        {item["scriptIndex"] for item in reviewed if _is_valid_suggestion(item["scriptIndex"], item)}
+        | {item["scriptIndex"] for item in unresolved if _is_valid_suggestion(item["scriptIndex"], item.get("candidate"))}
+    )
+    missing_ids = sorted({item["scriptIndex"] for item in unresolved} - set(suggested_ids))
+    verified_count = sum(1 for i, w in words.items() if str(i) in edits or i not in review)
     effective = {**report, "unmatched":unresolved, "reviewWords":reviewed, "matches":ordered,
                  "coverage":sum(w["scriptWords"] for w in ordered)/len(script),
                  "captionRevision":revision, "automaticRecovery":list(automatic.values()),
                  "manualTimings":[words[int(i)] for i in edits],
                  "pendingSceneOpenings":remaining_openings,
+                 "suggestedIndices": suggested_ids,
+                 "missingIndices": missing_ids,
+                 "verifiedCount": verified_count,
                  "premiumCaptionReady":not unresolved and not remaining_openings}
     # Keep the established ASR strong-evidence metric and gate independent of manual review.
     if failed:
