@@ -162,18 +162,36 @@ def production_prompt(project, config, badge=None):
     return ("Create an original vertical Instagram Reel production plan. Return only one JSON object "
           "conforming to the schema below. Copy the brief values exactly. Use contiguous estimated "
           "scene times from 0 through duration, and scene-relative animation/audio cue times. "
-          "Put only words to be spoken in narration, spell out numbers, and prefer clear sentences. "
+          "Respect brief.language strictly: do not force Hinglish into Hindi or English projects. "
+          "Write natural, engaging, conversational narration that preserves strong hooks, storytelling, "
+          "audience retention, essential technical terminology and factual accuracy without sacrificing content quality "
+          "or inventing claims, statistics or recognition guarantees. "
+          "For Hindi and Hinglish, prefer commonly spoken Indian words, short clear sentences with natural clause boundaries, "
+          "simple surrounding explanations around necessary technical terms, and avoid unnecessarily complex English vocabulary, "
+          "difficult Sanskrit-based Hindi words or excessive Hindi-English switching within a single sentence. "
+          "Put only spoken words in narration: represent spoken initialisms and abbreviations consistently across narration, "
+          "captions and word anchors, spell out numbers, percentages, symbols and units as intended to be spoken, and avoid "
+          "slash-separated alternatives, ambiguous abbreviations, tongue twisters, excessive slang, awkward pronunciation clusters "
+          "or unnecessary special characters. Maintain a moderate, natural speaking pace fitting the requested duration. "
+          "Illustrative narration examples only (not fixed substitutions or topic rules): "
+          "\"During emergency braking, ABS continuously modulates hydraulic brake pressure.\" -> "
+          "\"Jab aap achanak brake lagate hain, tab A B S brake pressure ko control karta hai.\"; "
+          "\"The system prevents wheel locking and improves manoeuvrability.\" -> "
+          "\"Ye wheel lock hone ka risk kam karta hai, aur gaadi ko steer karna aasaan banata hai.\"; "
+          "\"Approximately\" -> \"Lagbhag\"; \"Subsequently\" -> \"Uske baad\". "
           "For each scene, decide whether a change of delivery helps the listener. Tailor delivery to that scene's purpose, actual "
           "narration, niche and audience. For Hinglish, favor natural conversational Indian delivery and "
           "keep the approved code-switching. Use an optional scene note plus sparse cues with one intent "
           "from voiceDirection.intents (or a bare tag from allowedTags) and a zero-based beforeWord "
           "index into the whitespace-separated narration (word count means after the last word). "
-          "A cue can start a scene, a sentence or a meaningful clause within a sentence. Use cues only when "
-          "useful: highlight a hook, reveal, contrast or caution with a suitable emotion or delivery change. "
+          "A cue can start a scene, a sentence or a meaningful clause within a sentence. Use cues and meaningful pauses "
+          "only when genuinely useful: highlight a hook, reveal, contrast or caution with a suitable emotion or delivery change. "
           "Do not return pause-only directions for every scene when the narration supports other expressions. "
           "Leave neutral scenes untagged. Add a vocal reaction only when the spoken beat warrants it. "
-          "Avoid repetitive emotions, excessive pauses, overacting and irrelevant effects. "
-          "Keep the spoken wording identical and never put tags in narration. "
+          "Avoid repetitive emotions, excessive dramatic pauses, whispering, overacting, artificial vocal reactions and irrelevant effects. "
+          "Keep all spoken words identical across production JSON narration, voiceover.txt and voiceover-expressive.txt, "
+          "never put direction tags in spoken narration or captions, and ensure beforeWord indices and phrase-based animation anchors "
+          "match the final spoken wording. "
           "Specify original scene-specific visuals; use the style profile as art direction and "
           "the brand profile as identity. Asset entries are local relative filenames, never URLs. "
           "For every explanatory scene supply `storyboard.artwork` with named layers of shapes that actually depict "
@@ -343,7 +361,7 @@ def run_whisper(model, source, language, *, offset=0.0, **options):
     for segment in segments:
         for word in segment.words:
             text = word.word.strip()
-            start, end = float(word.start + offset), float(word.end + offset)
+            start, end = round(float(word.start + offset), 6), round(float(word.end + offset), 6)
             if normalized(text) and math.isfinite(start) and math.isfinite(end) and 0 <= start < end:
                 if words and start < words[-1]["end"]:
                     continue
@@ -354,7 +372,136 @@ def run_whisper(model, source, language, *, offset=0.0, **options):
     return words, metadata
 
 
-def align(project, plan, model_name=None, *, remote_words=None, remote_recognition=None, remote_alternate=None):
+def unresolved_gaps(scenes, words, duration):
+    """Locate contiguous script gaps strictly between reliable measured words."""
+    script = [(scene["id"], token) for scene in scenes for token in scene["narration"].split()
+              if normalized(token)]
+    anchors = {next((w for w in words if w["scene"] == s["id"]), None)["scriptIndex"]
+               for s in scenes if next((w for w in words if w["scene"] == s["id"]), None)
+               and next((w for w in words if w["scene"] == s["id"]), None)["match"] == "approximate"}
+    reliable = {}
+    for w in words:
+        if w["match"] != "approximate" and w.get("probability", 0) >= 0.25 and w["scriptIndex"] not in anchors:
+            for k in range(w["scriptIndex"], w["scriptIndex"] + w["scriptWords"]):
+                reliable[k] = w
+    gaps = []
+    i = 0
+    while i < len(script):
+        if i in reliable:
+            i += 1
+            continue
+        j = i
+        while j < len(script) and j not in reliable:
+            j += 1
+        t0 = reliable[i - 1]["end"] if i > 0 and (i - 1) in reliable else 0.0
+        t1 = reliable[j]["start"] if j < len(script) and j in reliable else duration
+        if t1 - t0 > 0.12:
+            has_en = any(re.fullmatch(r"[a-z]{3,}", normalized(script[x][1])) for x in range(i, j))
+            gaps.append((round(t0, 3), round(t1, 3), has_en))
+        i = j
+    return gaps
+
+
+def recovery_windows(scenes, words, duration, *, max_chunk=6.4, max_total=32.0):
+    """Pack unresolved intervals with short acoustic padding into bounded <=6.4s recovery windows."""
+    gaps = unresolved_gaps(scenes, words, duration)
+    merged = []
+    for t0, t1, has_en in gaps:
+        c0, c1 = max(0.0, t0 - 0.6), min(duration, t1 + 0.6)
+        if merged and max(c1, merged[-1][1]) - merged[-1][0] <= max_chunk and c0 <= merged[-1][1] + 0.8:
+            merged[-1] = [merged[-1][0], max(c1, merged[-1][1]), merged[-1][2] or has_en]
+        else:
+            merged.append([c0, c1, has_en])
+    windows = []
+    total = 0.0
+    for c0, c1, has_en in merged:
+        pos = c0
+        while pos < c1 and total < max_total:
+            end_c = min(c1, pos + max_chunk)
+            if c1 - end_c < 1.3:
+                end_c = c1
+            span = round(end_c - pos, 3)
+            if span >= 0.4 and total + span <= max_total + 1.5:
+                windows.append((round(pos, 2), round(end_c, 2), bool(has_en)))
+                total += span
+            if end_c >= c1:
+                break
+            pos = end_c - 0.9
+    return windows
+
+
+def merge_recovered_spans(base_tokens, base_words, recovered_tokens, *, is_witness=False):
+    """Merge recovered gap tokens non-destructively while keeping all reliable base intervals untouched."""
+    protected = []
+    kept = []
+    for w in base_words:
+        is_reliable_or_opening = w["match"] != "approximate" and w.get("probability", 0) >= 0.25
+        if not is_reliable_or_opening:
+            # Also protect existing witness scene-opening anchors if witness pass holds them
+            if not (is_witness and not w.get("asrIndices")):
+                continue
+        if is_witness:
+            if not w.get("asrIndices"):
+                protected.append((round(w["start"], 4), round(w["end"], 4)))
+        else:
+            for idx in w.get("asrIndices", []):
+                if 0 <= idx < len(base_tokens):
+                    tok = base_tokens[idx]
+                    protected.append((round(tok["start"], 4), round(tok["end"], 4)))
+                    kept.append(tok)
+    if is_witness:
+        kept = [tok for tok in base_tokens
+                if any(min(tok["end"], pe) > max(tok["start"], ps) + 1e-4 for ps, pe in protected)
+                or tok.get("probability", 0) >= 0.70]
+    # Preserve exact-English witness spans while allowing recovered Devanagari Hindi words to replace Hinglish witness substitutes.
+    blocked_alt = [(round(w["start"], 4), round(w["end"], 4)) for w in base_words
+                   if not is_witness and not w.get("asrIndices") and w["match"] != "approximate"
+                   and w.get("probability", 0) >= 0.25
+                   and normalized(w["text"]) == normalized(w.get("heard", ""))]
+    add = []
+    for tok in recovered_tokens:
+        ts, te = round(tok["start"], 4), round(tok["end"], 4)
+        for ps, pe in protected:
+            if te <= ps + 1e-4 or ts >= pe - 1e-4:
+                continue
+            # Trim small neighbor boundary overlaps without altering any verified protected span.
+            if ts < ps <= te and (ps - ts) >= 0.04:
+                te = min(te, ps)
+            elif ts <= pe < te and (te - pe) >= 0.04:
+                ts = max(ts, pe)
+            else:
+                te = ts
+                break
+        ts, te = round(ts, 4), round(te, 4)
+        if te - ts < 0.04:
+            continue
+        if any(min(te, pe) > max(ts, ps) + 1e-4 for ps, pe in protected):
+            continue
+        if any(min(te, ae) > max(ts, as_) + 1e-4 for as_, ae in blocked_alt):
+            continue
+        add.append({**tok, "start": ts, "end": te})
+    chosen = []
+    for tok in sorted(kept, key=lambda x: x["start"]) + sorted(add, key=lambda x: (-x["probability"], x["start"])):
+        ts, te = tok["start"], tok["end"]
+        if tok in kept or not any(min(te, c["end"]) > max(ts, c["start"]) + 0.02 for c in chosen):
+            chosen.append(tok)
+    if is_witness:
+        for tok in sorted(base_tokens, key=lambda x: (-x["probability"], x["start"])):
+            if not any(min(tok["end"], c["end"]) > max(tok["start"], c["start"]) + 1e-4 for c in chosen):
+                chosen.append(tok)
+    chosen.sort(key=lambda x: x["start"])
+    out = []
+    for tok in chosen:
+        if not out or tok["start"] >= out[-1]["end"] - 1e-4:
+            if out and tok["start"] < out[-1]["end"]:
+                tok = {**tok, "start": out[-1]["end"]}
+            if tok["start"] < tok["end"]:
+                out.append(tok)
+    return out
+
+
+def align(project, plan, model_name=None, *, remote_words=None, remote_recognition=None,
+          remote_alternate=None, remote_recovery=None):
     for scene in plan["scenes"]:
         validate_scene(scene)
     voice = project / "voice.wav"
@@ -390,7 +537,8 @@ def align(project, plan, model_name=None, *, remote_words=None, remote_recogniti
     if not transcript.is_file():
         alignment_stage("Transcribing local audio", 10)
         t_p0 = time.perf_counter()
-        recognition, metadata = recognize({"en": "en", "hi": "hi"}.get(plan["language"]))
+        whisper_lang = None if plan["language"] == "hinglish" else {"en": "en", "hi": "hi"}.get(plan["language"])
+        recognition, metadata = recognize(whisper_lang, beam_size=3, condition_on_previous_text=False)
         primary_transcribe_s = round(time.perf_counter() - t_p0, 3)
         save(transcript, recognition)
         save(info_path, metadata)
@@ -470,6 +618,83 @@ def align(project, plan, model_name=None, *, remote_words=None, remote_recogniti
                                                 **evidence.get("recognition", {}),
                                                 "windows": evidence.get("windows", windows),
                                                 "prompted": evidence.get("prompted")}
+    # Conditional targeted recovery of unresolved audio gaps when caption gate or openings stay incomplete.
+    alt_words = (load(project / report["independentRecognition"]["cache"]).get("words", [])
+                 if isinstance(report.get("independentRecognition"), dict)
+                 and report["independentRecognition"].get("cache")
+                 and (project / report["independentRecognition"]["cache"]).is_file()
+                 else (remote_alternate.get("words", []) if isinstance(remote_alternate, dict) else []))
+    anchors_pre = [next((w for w in words if w["scene"] == s["id"]), None) for s in plan["scenes"]]
+    needs_recovery = (
+        report["reliableCoverage"] < QUALITY_FLOOR
+        or bool(report["unmatched"])
+        or any(a is None or a["match"] == "approximate" for a in anchors_pre)
+    )
+    recovery_path = project / f".whisper-{key}-recovery-v1.json"
+    if needs_recovery and duration <= 180 and (
+        remote_words is None or remote_recovery is not None or recovery_path.is_file()
+    ):
+        try:
+            if remote_recovery is not None:
+                save(recovery_path, remote_recovery)
+            elif not recovery_path.is_file() and remote_words is None:
+                rec_windows = recovery_windows(plan["scenes"], words, duration)
+                rec_prim, rec_alt = [], []
+                if rec_windows:
+                    alignment_stage("Recovering unresolved narration spans", 82)
+                    t_r0 = time.perf_counter()
+                    from faster_whisper.audio import decode_audio
+                    sample_rate = 16000
+                    audio = decode_audio(str(voice), sampling_rate=sample_rate)
+                    rec_lang = None if plan["language"] == "hinglish" else {"en": "en", "hi": "hi"}.get(plan["language"])
+                    for start, end, has_en in rec_windows:
+                        left, right = round(start * sample_rate), round(end * sample_rate)
+                        if right <= left:
+                            continue
+                        rw, _ = recognize(rec_lang, samples=audio[left:right], offset=left / sample_rate,
+                                          beam_size=3, condition_on_previous_text=False)
+                        rec_prim.extend(w for w in rw if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
+                        if has_en and plan["language"] == "hinglish" and (end - start) <= 6.0:
+                            rwe, _ = recognize("en", samples=audio[left:right], offset=left / sample_rate,
+                                               beam_size=3, condition_on_previous_text=False)
+                            rec_alt.extend(w for w in rwe if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
+                    witness_transcribe_s = round(witness_transcribe_s + time.perf_counter() - t_r0, 3)
+                save(recovery_path, {"windows": rec_windows, "words": rec_prim, "alternate": rec_alt, "model": model_name})
+            rec_data = load(recovery_path)
+            merged_obs = merge_recovered_spans(observed, words, rec_data.get("words", []), is_witness=False)
+            merged_alt = merge_recovered_spans(alt_words, words, rec_data.get("alternate", []), is_witness=True)
+            rec_words, rec_report = match_script(plan["scenes"], merged_obs, duration, plan["language"],
+                                                 alternate=merged_alt if merged_alt else None)
+            rec_anchors = [next((w for w in rec_words if w["scene"] == s["id"]), None) for s in plan["scenes"]]
+            old_open_valid = sum(
+                1 for a, s in zip(anchors_pre, plan["scenes"])
+                if a and a["text"].split()[0] == next(t for t in s["narration"].split() if normalized(t))
+            )
+            new_open_valid = sum(
+                1 for a, s in zip(rec_anchors, plan["scenes"])
+                if a and a["text"].split()[0] == next(t for t in s["narration"].split() if normalized(t))
+            )
+            old_open_ok = sum(1 for a in anchors_pre if a and a["match"] != "approximate")
+            new_open_ok = sum(1 for a in rec_anchors if a and a["match"] != "approximate")
+            if (new_open_valid >= old_open_valid
+                    and rec_report["reliableMatches"] >= report["reliableMatches"]
+                    and (rec_report["reliableMatches"] > report["reliableMatches"]
+                         or rec_report["coverage"] > report["coverage"]
+                         or new_open_ok > old_open_ok)):
+                rec_report.update({k: report[k] for k in ("segmentRetry", "independentRecognition") if k in report})
+                rec_report["targetedRecovery"] = {
+                    "cache": recovery_path.name,
+                    "model": rec_data.get("model"),
+                    "windows": rec_data.get("windows", []),
+                    "recoveredPrimaryTokens": len(rec_data.get("words", [])),
+                    "recoveredWitnessTokens": len(rec_data.get("alternate", [])),
+                    **({"apexWordCount": len(rec_data["apexWords"])} if isinstance(rec_data.get("apexWords"), list) else {}),
+                    **({"apexSeconds": rec_data["apexSeconds"]} if rec_data.get("apexSeconds") is not None else {}),
+                    **({"forcedWordCount": len(rec_data["forcedWords"])} if isinstance(rec_data.get("forcedWords"), list) else {}),
+                }
+                words, report = rec_words, rec_report
+        except (ImportError, OSError, RuntimeError, ValueError, KeyError):
+            pass
     expressive = director_view(plan, director_state(project))["expressive"]
     report["spokenDirections"] = possible_spoken_tags(
         expressive, observed, words, plan["language"] in {"hi", "hinglish"}, duration)

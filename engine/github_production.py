@@ -428,7 +428,8 @@ def runner_fetch(job, request):
         if (data["operation"] != "transcribe" or preset is not None or data["preset"] is not None
                 or data["language"] != descriptor.get("language")
                 or data["revision"] != descriptor.get("revision")
-                or set(data["files"]) != {"voice.wav"}):
+                or "voice.wav" not in data["files"]
+                or any(name not in {"voice.wav", "recovery.json"} for name in data["files"])):
             raise ValueError("Private production package is missing required transcription inputs.")
     elif operation == "prepare":
         slug = descriptor.get("project")
@@ -452,6 +453,83 @@ def runner_fetch(job, request):
     }))
 
 
+def _valid_word_tokens(rows, duration, *, offset=0.0):
+    import math
+    words = []
+    for row in rows:
+        if isinstance(row, dict):
+            text, a, b, p = row.get("text") or row.get("word") or "", row.get("start"), row.get("end"), row.get("probability")
+        else:
+            text, a, b, p = getattr(row, "word", "") or "", getattr(row, "start", None), getattr(row, "end", None), getattr(row, "probability", None)
+        try:
+            start, end, prob = round(offset + float(a), 3), round(offset + float(b), 3), float(0.0 if p is None else p)
+        except (TypeError, ValueError):
+            continue
+        if (text.strip() and math.isfinite(start) and math.isfinite(end) and math.isfinite(prob)
+                and 0.0 <= start < end <= duration + 0.02 and (end - start) >= 0.03 and 0.0 < prob <= 1.0):
+            if words and start < words[-1]["end"]:
+                start = round(words[-1]["end"], 3)
+            if start < end and (end - start) >= 0.03:
+                words.append({"text": text.strip(), "start": start, "end": min(end, duration), "probability": prob})
+    return words
+
+
+def _apex_recovery(decoded, duration, language, recovery_spec, models_dir):
+    import stable_whisper
+
+    apex_dir = models_dir / "apex-ct2-int8"
+    if not (apex_dir / "model.bin").is_file():
+        return None
+    t0 = time.monotonic()
+    apex_model = stable_whisper.load_faster_whisper(
+        str(apex_dir), device="cpu", compute_type="int8", cpu_threads=4, local_files_only=True,
+    )
+    whisper_lang = "en" if language == "hinglish" else {"en": "en", "hi": "hi"}.get(language) or "en"
+    raw_segments, _ = apex_model.transcribe_original(
+        str(decoded), language=whisper_lang, beam_size=3, word_timestamps=True, condition_on_previous_text=False,
+    )
+    apex_rows = []
+    for seg in raw_segments:
+        for w in (seg.words or []):
+            apex_rows.append({"text": w.word, "start": w.start, "end": w.end, "probability": w.probability})
+    apex_words = _valid_word_tokens(apex_rows, duration)
+
+    forced_words = []
+    scenes = recovery_spec.get("scenes") or []
+    narration = "\n".join(str(s.get("narration", "")).strip() for s in scenes if str(s.get("narration", "")).strip())
+    if narration:
+        aligned = apex_model.align(
+            str(decoded), narration, language=whisper_lang, original_split=True,
+            fast_mode=True, suppress_silence=False, remove_instant_words=True, verbose=None,
+        )
+        forced_words = _valid_word_tokens(aligned.all_words(), duration)
+
+    # Combine forced-aligned tokens with non-overlapping native Apex ASR tokens so both missing gaps and ASR evidence are kept.
+    merged = list(forced_words)
+    for aw in apex_words:
+        if not any(min(aw["end"], ew["end"]) > max(aw["start"], ew["start"]) + 0.02 for ew in merged):
+            merged.append(aw)
+    merged.sort(key=lambda w: w["start"])
+    clean_words = []
+    for tok in merged:
+        ts, te = tok["start"], tok["end"]
+        if clean_words and ts < clean_words[-1]["end"]:
+            ts = round(clean_words[-1]["end"], 3)
+        if te - ts >= 0.03:
+            clean_words.append({**tok, "start": ts, "end": te})
+
+    del apex_model
+    return {
+        "model": "apex-ct2-int8",
+        "windows": recovery_spec.get("windows") or [[0.0, round(duration, 2), True]],
+        "words": clean_words,
+        "alternate": apex_words,
+        "apexWords": apex_words,
+        "forcedWords": forced_words,
+        "apexSeconds": round(time.monotonic() - t0, 3),
+    }
+
+
 def runner_transcribe(job):
     from alignment import DEVANAGARI
     from production_plan import load_whisper_model, probe_duration, run_whisper, whisper_model_name
@@ -472,10 +550,10 @@ def runner_transcribe(job):
     duration = probe_duration(decoded)
     language = manifest["language"]
     model_name = whisper_model_name(language, MODELS)
-    whisper_lang = {"en": "en", "hi": "hi"}.get(language)
+    whisper_lang = None if language == "hinglish" else {"en": "en", "hi": "hi"}.get(language)
     started = time.monotonic()
     model = load_whisper_model(model_name, MODELS)
-    words, recognition = run_whisper(model, decoded, whisper_lang)
+    words, recognition = run_whisper(model, decoded, whisper_lang, beam_size=3, condition_on_previous_text=False)
     words = [w for w in words if w["end"] <= duration + 0.02]
     payload = {
         "language": recognition["language"],
@@ -484,6 +562,25 @@ def runner_transcribe(job):
         "recognition": recognition,
         "words": words,
     }
+    rec_windows = manifest.get("windows")
+    if isinstance(rec_windows, list) and rec_windows:
+        from faster_whisper.audio import decode_audio
+        sample_rate = 16000
+        audio = decode_audio(str(decoded), sampling_rate=sample_rate)
+        rec_prim, rec_alt = [], []
+        for item in rec_windows[:10]:
+            start, end, has_en = float(item[0]), float(item[1]), bool(item[2]) if len(item) > 2 else False
+            left, right = max(0, round(start * sample_rate)), min(len(audio), round(end * sample_rate))
+            if right <= left:
+                continue
+            rw, _ = run_whisper(model, audio[left:right], whisper_lang, offset=left / sample_rate,
+                                beam_size=3, condition_on_previous_text=False)
+            rec_prim.extend(w for w in rw if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
+            if has_en and language == "hinglish" and (end - start) <= 6.0:
+                rwe, _ = run_whisper(model, audio[left:right], "en", offset=left / sample_rate,
+                                     beam_size=3, condition_on_previous_text=False)
+                rec_alt.extend(w for w in rwe if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
+        payload["recovery"] = {"windows": rec_windows[:10], "words": rec_prim, "alternate": rec_alt, "model": model_name}
     if (language == "hinglish" and model_name != "tiny.en" and duration <= 180
             and any(DEVANAGARI.search(w["text"]) for w in words)
             and (MODELS / "models--Systran--faster-whisper-tiny.en/refs/main").is_file()):
@@ -493,6 +590,14 @@ def runner_transcribe(job):
         alt_info["witnessModel"] = "tiny.en"
         payload["alternate"] = [w for w in alt_words if w["end"] <= duration + 0.02]
         payload["alternateRecognition"] = alt_info
+        del witness
+    else:
+        del model
+    recovery_file = folder / "recovery.json"
+    if recovery_file.is_file():
+        apex_payload = _apex_recovery(decoded, duration, language, read(recovery_file), MODELS)
+        if apex_payload is not None:
+            payload["recovery"] = apex_payload
     elapsed = round(time.monotonic() - started, 3)
     delivery = job / "delivery"
     delivery.mkdir()
@@ -507,6 +612,10 @@ def runner_transcribe(job):
         "model": model_name,
         "wordCount": len(words),
         "transcribeSeconds": elapsed,
+        **({"apexWordCount": len(payload["recovery"].get("apexWords", [])),
+            "forcedWordCount": len(payload["recovery"].get("forcedWords", [])),
+            "apexSeconds": payload["recovery"].get("apexSeconds")}
+           if isinstance(payload.get("recovery"), dict) and payload["recovery"].get("model") == "apex-ct2-int8" else {}),
         "sha256": hash_file(transcript),
         "ffmpeg": output(["ffmpeg", "-version"]).splitlines()[0],
     }

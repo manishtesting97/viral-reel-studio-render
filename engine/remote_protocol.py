@@ -82,7 +82,9 @@ def validate(manifest, limit):
     entries(files, limit)
     op, preset, language = (manifest[k] for k in ("operation", "preset", "language"))
     if op == "transcribe":
-        if preset is not None or language not in ("en", "hi", "hinglish", "auto") or set(files) != {"voice.wav"}:
+        if (preset is not None or language not in ("en", "hi", "hinglish", "auto")
+                or "voice.wav" not in files
+                or any(name not in {"voice.wav", "recovery.json"} for name in files)):
             raise ValueError("Invalid transcription inputs.")
     elif op == "render":
         if preset not in ("draft", "standard", "premium") or language is not None or "index.html" not in files:
@@ -169,7 +171,10 @@ def write_package(output, root, operation, revision, limit, preset=None, languag
                     if path.is_file():
                         names.append(path.relative_to(root).as_posix())
     else:
-        names = ["voice.wav"] if operation == "transcribe" else ["index.html", "voice.wav", "captions.ass"]
+        if operation == "transcribe":
+            names = ["voice.wav", *(["recovery.json"] if (root / "recovery.json").is_file() else [])]
+        else:
+            names = ["index.html", "voice.wav", "captions.ass"]
         if operation == "render":
             assets = root / "assets"
             if assets.is_symlink():
