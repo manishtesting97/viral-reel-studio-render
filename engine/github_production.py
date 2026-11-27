@@ -213,15 +213,22 @@ def preflight(sha, renderer_sha):
     if (pinned["sha"] != renderer_sha or workflow["state"] != "active"
             or workflow["path"] != f".github/workflows/{WORKFLOW}"):
         raise ValueError("Approve the deployed public production workflow commit before uploading.")
-    flag = renderer_api("/actions/variables/VRS_HYBRID_PRODUCTION_SHA", missing=True)
-    if not flag or flag.get("value") != renderer_sha:
-        raise ValueError("Enable hybrid production only after authorization, secure transfer and quota checks.")
     environment = renderer_api("/environments/vrs-hybrid-production")
     if environment.get("can_admins_bypass") is not False:
         raise ValueError("Disable administrator bypass on the protected production environment before uploading.")
     branches = renderer_api("/environments/vrs-hybrid-production/deployment-branch-policies")["branch_policies"]
     if {policy["name"] for policy in branches} != {"main"}:
         raise ValueError("Restrict the protected production environment to the main branch.")
+    workload = renderer_api("/actions/variables/VRS_HYBRID_WORKLOAD", missing=True)
+    classification = (workload or {}).get("value")
+    if classification == "content-production":
+        raise ValueError("GitHub-hosted rendering is unavailable for routine reel production under the standard Actions terms. "
+                         "Use explicit Local execution for this workload.")
+    if classification not in {"software-project", "agreement-covered"}:
+        raise ValueError("GitHub-hosted execution is disabled until this workload is classified under the applicable Actions terms.")
+    flag = renderer_api("/actions/variables/VRS_HYBRID_PRODUCTION_SHA", missing=True)
+    if not flag or flag.get("value") != renderer_sha:
+        raise ValueError("Hosted execution is disabled for this renderer SHA. Enable the verified pin after confirming secure transfer and the $0 spending block.")
     return branch, workflow["id"]
 
 
