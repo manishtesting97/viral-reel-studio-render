@@ -11,7 +11,8 @@ import subprocess
 import time
 
 import asset_library
-from motion_choreography import compile_scene_storyboard, validate_artwork
+from motion_choreography import (compile_scene_storyboard, model_events,
+                                 validate_artwork, validate_model)
 from production_plan import BRAND_DIR, STYLE_LIB, digest, load, profiles, save, write
 import production_render
 import sponsorship
@@ -151,6 +152,8 @@ COMMON_CSS = """/* Auto-generated universal editorial scene stylesheet inheritin
   bottom: max(550px, var(--vrs-caption-clearance, 550px));
   gap: min(64px, var(--vrs-visual-gap));
 }
+.vrs-procedural-model {position:relative; width:100%; min-height:0; flex:1}
+.vrs-procedural-model canvas {position:absolute; inset:0; width:100%; height:100%; object-fit:contain}
 .vrs-auto-heading {
   flex: none;
   margin: 0;
@@ -732,6 +735,7 @@ def select_component(
     total: int,
     used_recently: list[str],
     assignment: dict | None = None,
+    brand: dict | None = None,
 ) -> str:
     """Select an appropriate reusable editorial visual component deterministically from semantic signals."""
     sid = scene["id"].lower()
@@ -742,6 +746,16 @@ def select_component(
     niche = (brief.get("niche") or "").lower()
     blob = f"{sid} {heading} {desc} {narr}"
 
+    if index + 1 == total and brand is not None:
+        cta = brand.get("cta")
+        enabled = (cta is not False and str(cta).lower() not in {"none", "off", "disabled"}
+                   and (cta or brand.get("instagramUsername") or brand.get("handle")))
+        if enabled and (sid in {"cta", "outro", "brand-outro", "branded-outro", "creator-cta"}
+                        or scene.get("storyboard", {}).get("composition") == "creator_cta_outro"
+                        or re.search(r"\bfollow\b.*@", heading)):
+            return "creator_cta_outro"
+    if "model" in scene.get("storyboard", {}):
+        return "procedural-model"
     if assignment and assignment.get("layers") and assignment.get("mode") in {"hybrid", "image", "video"}:
         if "artwork" in scene.get("storyboard", {}) and assignment["mode"] == "hybrid":
             return "semantic-artwork"
@@ -1198,6 +1212,162 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
 """
 
 
+def _procedural_script(sid, model, events):
+    spec = json.dumps({"id": sid, **model, "events": events})
+    return "  const model = " + spec + ";\n" + r"""
+  window.__hf = window.__hf || {};
+  window.__hf.buildReady = window.__hf.buildReady || {};
+  window.__hf.buildReady[model.id] = (async () => {
+    const mount = root.querySelector(".vrs-procedural-model");
+    const T = await import(new URL("assets/three.module.min.js", document.baseURI).href);
+    const width = 944, height = 760;
+    const world = new T.Scene();
+    const camera = new T.PerspectiveCamera(model.fov || 38, width / height, 0.1, 100);
+    const renderer = new T.WebGLRenderer({alpha:true, antialias:true, powerPreference:"low-power"});
+    renderer.setSize(width, height, false);
+    renderer.setClearColor(0x000000, 0);
+    renderer.toneMapping = T.ACESFilmicToneMapping;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = T.PCFSoftShadowMap;
+    mount.append(renderer.domElement);
+    world.add(new T.HemisphereLight(0xe5f2ff, 0x776656, 2));
+    for (const [position, color, intensity] of [
+      [[-4, 9, 6], 0xfff0d9, 3], [[4, 4, -6], 0xcceaff, 2.3], [[0, 2, 8], 0xdbe9ff, 0.7]
+    ]) {
+      const light = new T.DirectionalLight(color, intensity);
+      light.position.fromArray(position);
+      if (position[0] < 0) {
+        light.castShadow = true;
+        light.shadow.mapSize.set(512, 512);
+        light.shadow.camera.left = light.shadow.camera.bottom = -8;
+        light.shadow.camera.right = light.shadow.camera.top = 8;
+        light.shadow.normalBias = 0.025;
+      }
+      world.add(light);
+    }
+    const ground = new T.Mesh(new T.PlaneGeometry(30, 30), new T.ShadowMaterial({opacity:0.18}));
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -1.75;
+    ground.receiveShadow = true;
+    if (model.groundShadows !== false) world.add(ground);
+
+    function loft(sections) {
+      const points = [], indices = [], uv = [], sides = 32;
+      for (const [x, y, z, ry, rz] of sections) {
+        for (let j = 0; j < sides; j++) {
+          const angle = j * Math.PI * 2 / sides;
+          points.push(x, y + Math.cos(angle)*ry, z + Math.sin(angle)*rz);
+          uv.push(j/sides,(x-sections[0][0])/(sections.at(-1)[0]-sections[0][0]));
+        }
+      }
+      for (let i = 0; i < sections.length - 1; i++) {
+        for (let j = 0; j < sides; j++) {
+          const a=i*sides+j, b=i*sides+(j+1)%sides;
+          indices.push(a,b,a+sides,b,b+sides,a+sides);
+        }
+      }
+      const end = (sections.length-1)*sides;
+      for (let j = 1; j < sides-1; j++) indices.push(0,j+1,j,end,end+j,end+j+1);
+      const geometry = new T.BufferGeometry();
+      geometry.setAttribute("position", new T.Float32BufferAttribute(points,3));
+      geometry.setAttribute("uv", new T.Float32BufferAttribute(uv,2));
+      geometry.setIndex(indices);
+      geometry.computeVertexNormals();
+      return geometry;
+    }
+    const finishes = new Map();
+    function finish(name) {
+      if (!name || name === "matte") return null;
+      if (finishes.has(name)) return finishes.get(name);
+      const pixels = new Uint8Array(32*32*4);
+      for (let i=0;i<1024;i++) {
+        const shade = name === "brushed" ? 180+(Math.floor(i/32)*43)%72 : 164+i*59%87;
+        pixels.set([shade,shade,shade,255],i*4);
+      }
+      const texture = new T.DataTexture(pixels,32,32);
+      texture.wrapS = texture.wrapT = T.RepeatWrapping;
+      texture.repeat.set(6,6);
+      texture.needsUpdate = true;
+      finishes.set(name,texture);
+      return texture;
+    }
+    const radians = values => values.map(value => T.MathUtils.degToRad(value));
+    const initial = new Map();
+    const parts = new Map();
+    const assembly = new T.Group();
+    world.add(assembly);
+    for (const part of model.parts) {
+      const [x,y,z] = part.size;
+      let geometry;
+      if (part.shape === "loft") geometry = loft(part.sections);
+      else if (part.shape === "tube") {
+        const curve = new T.CatmullRomCurve3(part.points.map(point => new T.Vector3().fromArray(point)));
+        geometry = new T.TubeGeometry(curve,48,x/2,8,false);
+      } else if (part.shape === "box") geometry = new T.BoxGeometry(x,y,z);
+      else if (part.shape === "sphere") {
+        geometry = new T.SphereGeometry(0.5,32,18);
+        geometry.scale(x,y,z);
+      } else if (part.shape === "cylinder") {
+        geometry = new T.CylinderGeometry(0.5,0.5,y,32);
+        geometry.scale(x,1,z);
+      } else {
+        geometry = new T.TorusGeometry((x-z)/2,z/2,12,40);
+        geometry.scale(1,y/x,1);
+      }
+      const opacity = part.opacity ?? 1;
+      const material = new T.MeshStandardMaterial({
+        color:part.color, metalness:part.metalness ?? 0.16, roughness:part.roughness ?? 0.48,
+        roughnessMap:finish(part.texture),
+        transparent:opacity<1, opacity, depthWrite:opacity===1
+      });
+      const mesh = new T.Mesh(geometry,material);
+      mesh.castShadow = opacity===1;
+      mesh.receiveShadow = true;
+      (part.fixed ? world : assembly).add(mesh);
+      parts.set(part.id,mesh);
+      initial.set(part.id,{position:part.position || [0,0,0],rotation:radians(part.rotation || [0,0,0]),
+        hidden:model.events.some(event=>event.target===part.id && event.action==="reveal")});
+    }
+    const ease = gsap.parseEase("power2.inOut");
+    function draw(seconds) {
+      const elapsed = seconds - scene.start;
+      camera.position.fromArray(model.eye);
+      assembly.position.set(0,0,0);
+      assembly.rotation.set(0,0,0);
+      for (const [id,mesh] of parts) {
+        const base = initial.get(id);
+        mesh.position.fromArray(base.position);
+        mesh.rotation.set(...base.rotation);
+        mesh.scale.setScalar(base.hidden?0.001:1);
+      }
+      for (const event of model.events) {
+        if (elapsed < event.at) break;
+        const p = ease(Math.min(1,(elapsed-event.at)/event.duration));
+        if (event.action === "camera") camera.position.lerp(new T.Vector3().fromArray(event.value),p);
+        else {
+          const mesh=event.target==="assembly" ? assembly : parts.get(event.target);
+          if (event.action === "reveal") mesh.scale.setScalar(Math.max(.001,p));
+          if (event.action === "move") mesh.position.lerp(new T.Vector3().fromArray(event.value),p);
+          if (event.action === "rotate") {
+            const target=radians(event.value);
+            mesh.rotation.set(...target.map((angle,i)=>{
+              const from=[mesh.rotation.x,mesh.rotation.y,mesh.rotation.z][i];
+              return from+(angle-from)*p;
+            }));
+          }
+        }
+      }
+      camera.lookAt(...model.look);
+      renderer.render(world,camera);
+    }
+    draw(scene.start);
+    window.addEventListener("hf-seek", event => {
+      const seconds = Number(event.detail?.time ?? event.detail ?? 0);
+      if (seconds >= scene.start - 0.05 && seconds <= scene.end + 0.08) draw(seconds);
+    });
+  })();"""
+
+
 def _three_js_script(
     sid: str,
     mode: str,
@@ -1625,7 +1795,16 @@ def _render_component_html_and_js(
     extra_js = ""
     is_git_ctx = any(k in blob_low for k in ("git", "github", "commit", "repository", "pull request"))
 
-    if component == "semantic-artwork":
+    if component == "procedural-model":
+        model = scene["storyboard"]["model"]
+        events = model_events(scene, scene_words or [], s_start, s_dur)
+        body = ('<div class="vrs-auto-stage" style="height:auto;flex:1;align-items:center;justify-content:center">'
+                '<div class="vrs-procedural-model">'
+                '</div></div>')
+        extra_js = _procedural_script(sid, model, events)
+        # The WebGL listener drives model motion from the same seek time as the GSAP timeline.
+        storyboard["events"] = []
+    elif component == "semantic-artwork":
         body = _artwork_markup(storyboard)
     elif component == "comparison_split":
         entities = [str(e).strip() for e in (storyboard.get("entities") or []) if str(e).strip()]
@@ -2259,16 +2438,28 @@ def _render_component_html_and_js(
               </div>
             </div>"""
         else:
+            heading_html = ""
             photo_tag = '<div class="vrs-portrait-ring"><img src="assets/creator-photo.png" alt="" /></div>' if has_creator_photo else ""
+            brand_name = brand.get("brandName")
+            subline = f"{brand_name} · {role}" if brand_name and brand_name != owner else role
+            spoken = scene_words or []
+            follow = next((word for word in reversed(spoken) if re.search(r"\b(?:follow|subscribe)\b|फॉलो|फ़ॉलो", word["text"], re.I)), None)
+            identity = next((word for word in spoken if re.search(r"\b(?:instagram)\b|इंस्टाग्राम", word["text"], re.I)), None)
+            follow_at = max(0, follow["start"]-s_start) if follow else None
+            handle_at = max(0, identity["start"]-s_start) if identity else .35
+            storyboard["events"] = [
+                {"action":"reveal","target":"creator-profile","at":0,"duration":.45},
+                {"action":"reveal","target":"creator-handle","at":handle_at,"duration":.35},
+            ] + ([{"action":"click","target":"follow-cta","at":follow_at,"duration":.24}] if follow_at is not None else [])
             body = f"""
-            <div class="vrs-auto-stage">
+            <div class="vrs-auto-stage" style="height:auto;flex:1;justify-content:center">
               <div class="vrs-cta-card" data-ev="creator-profile" style="position:relative">
                 {photo_tag}
                 <div style="font-size:56px;font-weight:800;line-height:1.1;color:#181412">{escape(owner)}</div>
-                <div style="font-size:30px;font-weight:700;color:{accent}">{escape(handle)}</div>
-                <div style="font-size:25px;font-weight:600;color:#57534e">{escape(role)}</div>
-                <div class="vrs-cta-pill" id="cta-pill-{escape(sid)}" data-ev="follow-cta" data-active-text="✓ Following {escape(handle)}" data-active-bg="#059669" style="margin-top:8px">
-                  <span>↑</span><span>{escape(cta)}</span>
+                <div data-ev="creator-handle" style="font-size:46px;font-weight:700;color:{accent}">{escape(handle)}</div>
+                <div style="font-size:25px;font-weight:600;color:#57534e">{escape(subline)}</div>
+                <div class="vrs-cta-pill" id="cta-pill-{escape(sid)}" data-ev="follow-cta" data-active-text="✓ Following" data-active-bg="#059669" style="margin-top:8px">
+                  <span data-click-label>{escape(str(cta))}</span>
                 </div>
                 {cursor_svg}
               </div>
@@ -2289,7 +2480,8 @@ def _render_component_html_and_js(
           <div style="height:10px;background:#ece4da;border-radius:999px;overflow:hidden"><div class="js-bar" data-width="100%" style="height:100%;background:{accent};border-radius:999px"></div></div>
         </div>"""
 
-    layout = "vrs-auto-layout vrs-artwork-layout" if component == "semantic-artwork" else "vrs-auto-layout"
+    layout = ("vrs-auto-layout vrs-artwork-layout"
+              if component in {"semantic-artwork", "procedural-model", "creator_cta_outro"} else "vrs-auto-layout")
     html_doc = f"""<link rel="stylesheet" href="assets/vrs-auto.css" />
 <div class="vrs-auto-scene">
   <div class="vrs-auto-bg"></div>
@@ -2302,6 +2494,8 @@ def _render_component_html_and_js(
 </div>
 """
     js_doc = _common_js_setup(sid, scene.get("animation", []), extra_js, storyboard=storyboard)
+    if component == "procedural-model":
+        storyboard["events"] = events
     return html_doc, js_doc, storyboard
 
 
@@ -2390,7 +2584,14 @@ def validate_visual_sources(
             if scene_mode != "custom":
                 if storyboard.get("limitation"):
                     issues.append(f"{sid}: {storyboard['limitation']} Use supplied media or a reviewed custom scene.")
-                elif "artwork" in storyboard and ('class="vrs-semantic-artwork"' not in raw_html or not js_path.is_file()):
+                elif ('data-ev="creator-profile"' not in raw_html and scene["id"] not in {"outro", "brand-outro"}
+                      and cfg.get("scenes", {}).get(sid, {}).get("component") == "creator_cta_outro"):
+                    issues.append(f"{sid}: configured creator outro is missing.")
+                elif "model" in storyboard and cfg.get("scenes", {}).get(sid, {}).get("component") != "creator_cta_outro":
+                    if 'class="vrs-procedural-model"' not in raw_html or not js_path.is_file():
+                        issues.append(f"{sid}: automatic scene is missing its procedural model.")
+                elif ("artwork" in storyboard and cfg.get("scenes", {}).get(sid, {}).get("component") != "creator_cta_outro"
+                      and ('class="vrs-semantic-artwork"' not in raw_html or not js_path.is_file())):
                     issues.append(f"{sid}: automatic scene is missing its narration-driven artwork. Prepare it again.")
             if FORBIDDEN_EXT_URLS.search(raw_html):
                 issues.append(f"{sid}.html references an external network URL.")
@@ -2523,7 +2724,7 @@ def _resolve_scene_plan(
         else:
             scene_mode = "auto"
         assign = assignments.get(sid)
-        component = select_component(scene, brief, idx, len(scenes), used_recently, assign)
+        component = select_component(scene, brief, idx, len(scenes), used_recently, assign, brand)
         used_recently.append(component)
         actual = measured_map.get(sid, {"start": scene["start"], "end": scene["end"], "animation": scene.get("animation", [])})
         scene_words = words_by_scene.get(sid, [])
@@ -2645,10 +2846,14 @@ def generate_visuals(
                 or (item["assign"] or {}).get("mode") in {"image", "video"}):
             continue
         storyboard = item["scene"].get("storyboard", {})
+        if item["component"] == "creator_cta_outro":
+            continue
         if storyboard.get("limitation"):
             raise ValueError(f"{item['id']}: {storyboard['limitation']} Use supplied media or a reviewed custom scene.")
         validate_artwork(item["scene"])
-        if item["component"] == "semantic-artwork" and active_timing and not item["words"] and storyboard["artwork"].get("events"):
+        validate_model(item["scene"])
+        if (item["component"] in {"semantic-artwork", "procedural-model"} and active_timing and not item["words"]
+                and (storyboard.get("artwork", {}).get("events") or storyboard.get("model", {}).get("events"))):
             raise ValueError(f"{item['id']}: approved narration timings are missing for the artwork.")
 
     source_dir = project / "visuals"

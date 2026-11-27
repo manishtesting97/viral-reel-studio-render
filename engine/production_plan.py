@@ -54,9 +54,9 @@ def timing_key(voice, plan):
     base["scenes"] = []
     for scene in plan["scenes"]:
         row = {key: value for key, value in scene.items() if key != "voice_direction"}
-        if {"artwork", "limitation"} & row.get("storyboard", {}).keys():
+        if {"artwork", "model", "limitation"} & row.get("storyboard", {}).keys():
             storyboard = {key: value for key, value in row.pop("storyboard").items()
-                          if key not in {"artwork", "limitation"}}
+                          if key not in {"artwork", "model", "limitation"}}
             if storyboard:
                 row["storyboard"] = storyboard
         base["scenes"].append(row)
@@ -95,6 +95,7 @@ def validate(value, rule, path="$", *, schema=None):
         "array": type(value) is list,
         "string": type(value) is str,
         "integer": type(value) is int,
+        "boolean": type(value) is bool,
         "number": type(value) in (int, float) and abs(value) <= 1e100,
     }
     if (kind and not valid[kind]) or ("const" in rule and value != rule["const"]):
@@ -236,7 +237,16 @@ def production_prompt(project, config, badge=None):
           "match the final spoken wording. "
           "Specify original scene-specific visuals; use the style profile as art direction and "
           "the brand profile as identity. Asset entries are local relative filenames, never URLs. "
-          "For every explanatory scene (before the closing CTA scene) supply `storyboard.artwork` with named layers of shapes that actually depict "
+          "Choose the best visual medium for each explanatory scene. For subjects that benefit from depth, perspective or moving parts, "
+          "supply storyboard.model with named box, sphere, cylinder, torus, loft or tube parts and appropriate materials and finishes. "
+          "Set a perspective eye and look target. Use groundShadows false for suspended diagrams with no meaningful ground. "
+          "Positions use scene units, rotations use degrees. "
+          "A loft follows local X and uses sections [x, centerY, centerZ, radiusY, radiusZ] in increasing X order with positive radii; "
+          "use size [1,1,1] for a loft. Tube points are 3D coordinates and size[0] is the tube diameter. For torus specify "
+          "outer X diameter and tube Z diameter. For other primitives use full dimensions. Reuse relevant project or licensed library media. "
+          "Model events use exact spoken anchors. Reveal takes value [0,0,0]; move, rotate and camera take destination vectors. "
+          "Use target camera to move the eye and assembly to move or rotate the whole model. "
+          "For detailed 2D or original interface scenes supply `storyboard.artwork` with named layers of shapes that actually depict "
           "the objects, interfaces and relationships spoken about. Draw on a 944 by 760 canvas inside the safe zone. "
           "Shapes are rect, ellipse, path, text and image. Use box [x,y,width,height] for rect, ellipse and image. "
           "For text use box [x,y,0,0] (top-left), text and size. For paths supply SVG path data d. "
@@ -252,7 +262,7 @@ def production_prompt(project, config, badge=None):
           "If a scene needs true 3D or missing assets and cannot be illustrated faithfully, set storyboard.limitation "
           "to the specific requirement instead of artwork. This stops automatic substitution and permits supplied media "
           "or a reviewed custom scene. "
-          "For a visual-only revision of a recorded plan, change artwork only to retain approved timing. "
+          "For a visual-only revision of a recorded plan, change storyboard.artwork or storyboard.model only to retain approved timing. "
           "Do not fabricate product screenshots, medical claims, metrics or unsupported facts. "
           f"Output format & downloadable JSON file: return one valid JSON object matching the schema below with zero "
           f"extra commentary inside the JSON, AND also generate and provide that exact JSON as a downloadable `.json` file "
@@ -286,7 +296,7 @@ def save_director(project, plan, selected, edited=None):
 
 
 def import_plan(project, plan):
-    from motion_choreography import validate_artwork
+    from motion_choreography import validate_artwork, validate_model
 
     validate(plan, load(SCHEMA))
     brief = load(project / "brief.json")
@@ -297,6 +307,7 @@ def import_plan(project, plan):
     for scene in plan["scenes"]:
         validate_scene(scene)
         validate_artwork(scene)
+        validate_model(scene)
         sid = scene["id"]
         if sid in scene_ids or not math.isclose(scene["start"], expected, abs_tol=1e-6):
             raise ValueError(f"{sid}: duplicate ID or discontinuous scene timeline.")

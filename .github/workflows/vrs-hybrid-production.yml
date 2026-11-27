@@ -13,12 +13,13 @@ concurrency:
   cancel-in-progress: false
 jobs:
   render:
+    name: Isolated production · setup through private delivery
     if: github.repository == 'manishtesting97/viral-reel-studio-render' && !github.event.repository.private && github.ref == 'refs/heads/main' && github.sha == inputs.expected_sha && ((inputs.probe && github.sha == vars.VRS_HYBRID_PROBE_SHA) || (!inputs.probe && github.sha == vars.VRS_HYBRID_PRODUCTION_SHA))
     environment: vrs-hybrid-production
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
-      - name: Refuse debug logging
+      - name: 01 · Environment and security · refuse debug logging
         env:
           DEBUG: ${{ runner.debug }}
         run: test "$DEBUG" != 1
@@ -74,17 +75,19 @@ jobs:
         run: |
           umask 077
           python3 -m pip install --no-cache-dir -r installers/python.lock.txt
-      - name: Verify private input
+      - name: 01 · Verify private draft metadata before downloading media
+        id: metadata
         if: ${{ !inputs.probe }}
         env:
           GH_TOKEN: ${{ secrets.VRS_PRIVATE_TRANSFER_TOKEN }}
           REQUEST: ${{ inputs.request_id }}
         run: |
           umask 077
-          python3 engine/github_production.py fetch "$VRS_JOB" "$REQUEST" >/dev/null 2>&1 ||
-            { echo 'Private input verification failed'; exit 1; }
-      - name: Install offline Whisper and Hinglish recovery models
-        if: ${{ !inputs.probe }}
+          python3 engine/github_production.py metadata "$VRS_JOB" "$REQUEST" >> "$GITHUB_OUTPUT"
+      - name: 02 · Prepare pinned Whisper and optional Apex and stable-ts runtime
+        if: ${{ steps.metadata.outputs.operation == 'transcribe' }}
+        env:
+          RECOVERY: ${{ steps.metadata.outputs.recovery }}
         run: |
           umask 077
           models="$RUNNER_TEMP/vrs-models"
@@ -99,73 +102,98 @@ jobs:
           from huggingface_hub import snapshot_download
 
           models_dir = Path(sys.argv[1])
-          manifest = json.loads((Path(os.environ["VRS_JOB"]) / "manifest.json").read_text(encoding="utf-8"))
-          if manifest.get("operation") == "transcribe":
-              lock = json.loads(Path("installers/runtime.lock.json").read_text(encoding="utf-8"))
-              for name, revision in lock["models"].items():
-                  path = Path(snapshot_download(
-                      "Systran/faster-whisper-" + name,
-                      revision=revision,
-                      cache_dir=str(models_dir),
-                      allow_patterns=["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "vocabulary.txt"],
-                  ))
-                  ref = path.parent.parent / "refs" / "main"
-                  ref.parent.mkdir(exist_ok=True)
-                  tmp = ref.with_suffix(".tmp")
-                  tmp.write_text(path.name, encoding="utf-8")
-                  tmp.replace(ref)
-                  for required in ("model.bin", "config.json", "tokenizer.json"):
-                      assert (path / required).is_file() and (path / required).stat().st_size > 0
-              if "recovery.json" in manifest.get("files", {}):
-                  subprocess.run([
-                      sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                      "--index-url", "https://download.pytorch.org/whl/cpu",
-                      "torch==2.6.0+cpu", "torchaudio==2.6.0+cpu",
-                  ], check=True)
-                  subprocess.run([
-                      sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                      "transformers==5.24.1", "safetensors==0.8.0",
-                  ], check=True)
-                  subprocess.run([
-                      sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                      "--no-deps", "stable-ts==2.19.1",
-                  ], check=True)
-                  hf_dir = Path(os.environ["RUNNER_TEMP"]) / "vrs-apex-hf"
-                  snapshot_download(
-                      "Oriserve/Whisper-Hindi2Hinglish-Apex",
-                      revision="f3214eed20b4e4d4144e739982d911f87b9cb223",
-                      local_dir=str(hf_dir),
-                  )
-                  cfg_path = hf_dir / "config.json"
-                  cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                  cfg["dtype"] = "float32"
-                  cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-                  gen_path = hf_dir / "generation_config.json"
-                  gen = json.loads(gen_path.read_text(encoding="utf-8"))
-                  gen["alignment_heads"] = [[2, 4], [2, 11], [3, 3], [3, 6], [3, 11], [3, 14]]
-                  gen_path.write_text(json.dumps(gen, indent=2), encoding="utf-8")
-                  out_dir = models_dir / "apex-ct2-int8"
-                  from ctranslate2.converters import TransformersConverter
-                  TransformersConverter(
-                      str(hf_dir),
-                      copy_files=["tokenizer.json", "preprocessor_config.json"],
-                  ).convert(str(out_dir), quantization="int8", force=True)
-                  ct2_cfg_path = out_dir / "config.json"
-                  ct2_cfg = json.loads(ct2_cfg_path.read_text(encoding="utf-8"))
-                  ct2_cfg["alignment_heads"] = [[2, 4], [2, 11], [3, 3], [3, 6], [3, 11], [3, 14]]
-                  ct2_cfg_path.write_text(json.dumps(ct2_cfg, indent=2), encoding="utf-8")
-                  shutil.rmtree(hf_dir, ignore_errors=True)
-                  for required in ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"):
-                      assert (out_dir / required).is_file() and (out_dir / required).stat().st_size > 0
+          lock = json.loads(Path("installers/runtime.lock.json").read_text(encoding="utf-8"))
+          for name, revision in lock["models"].items():
+              path = Path(snapshot_download(
+                  "Systran/faster-whisper-" + name,
+                  revision=revision,
+                  cache_dir=str(models_dir),
+                  allow_patterns=["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "vocabulary.txt"],
+              ))
+              ref = path.parent.parent / "refs" / "main"
+              ref.parent.mkdir(exist_ok=True)
+              tmp = ref.with_suffix(".tmp")
+              tmp.write_text(path.name, encoding="utf-8")
+              tmp.replace(ref)
+              for required in ("model.bin", "config.json", "tokenizer.json"):
+                  assert (path / required).is_file() and (path / required).stat().st_size > 0
+          if os.environ["RECOVERY"] == "true":
+              subprocess.run([
+                  sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                  "--index-url", "https://download.pytorch.org/whl/cpu",
+                  "torch==2.6.0+cpu", "torchaudio==2.6.0+cpu",
+              ], check=True)
+              subprocess.run([
+                  sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                  "transformers==5.24.1", "safetensors==0.8.0",
+              ], check=True)
+              subprocess.run([
+                  sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                  "--no-deps", "stable-ts==2.19.1",
+              ], check=True)
+              hf_dir = Path(os.environ["RUNNER_TEMP"]) / "vrs-apex-hf"
+              snapshot_download(
+                  "Oriserve/Whisper-Hindi2Hinglish-Apex",
+                  revision="f3214eed20b4e4d4144e739982d911f87b9cb223",
+                  local_dir=str(hf_dir),
+              )
+              cfg_path = hf_dir / "config.json"
+              cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+              cfg["dtype"] = "float32"
+              cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+              gen_path = hf_dir / "generation_config.json"
+              gen = json.loads(gen_path.read_text(encoding="utf-8"))
+              gen["alignment_heads"] = [[2, 4], [2, 11], [3, 3], [3, 6], [3, 11], [3, 14]]
+              gen_path.write_text(json.dumps(gen, indent=2), encoding="utf-8")
+              out_dir = models_dir / "apex-ct2-int8"
+              from ctranslate2.converters import TransformersConverter
+              TransformersConverter(
+                  str(hf_dir),
+                  copy_files=["tokenizer.json", "preprocessor_config.json"],
+              ).convert(str(out_dir), quantization="int8", force=True)
+              ct2_cfg_path = out_dir / "config.json"
+              ct2_cfg = json.loads(ct2_cfg_path.read_text(encoding="utf-8"))
+              ct2_cfg["alignment_heads"] = [[2, 4], [2, 11], [3, 3], [3, 6], [3, 11], [3, 14]]
+              ct2_cfg_path.write_text(json.dumps(ct2_cfg, indent=2), encoding="utf-8")
+              shutil.rmtree(hf_dir, ignore_errors=True)
+              for required in ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"):
+                  assert (out_dir / required).is_file() and (out_dir / required).stat().st_size > 0
           EOF
           printf 'VRS_MODEL_DIR=%s\n' "$models" >> "$GITHUB_ENV"
-      - name: Process private job offline
+      - name: 01 · Retrieve and verify private inputs after prerequisites
         if: ${{ !inputs.probe }}
+        env:
+          GH_TOKEN: ${{ secrets.VRS_PRIVATE_TRANSFER_TOKEN }}
+          REQUEST: ${{ inputs.request_id }}
+          OPERATION: ${{ steps.metadata.outputs.operation }}
+          RECOVERY: ${{ steps.metadata.outputs.recovery }}
+        run: |
+          umask 077
+          python3 engine/github_production.py fetch "$VRS_JOB" "$REQUEST" "$OPERATION" "$RECOVERY" >/dev/null 2>&1 ||
+            { echo 'Private input verification failed'; exit 1; }
+      - name: 02 · Whisper transcription and optional Apex and stable-ts recovery
+        id: transcribe
+        if: ${{ steps.metadata.outputs.operation == 'transcribe' }}
         run: |
           umask 077
           bash engine/github_render_sandbox.sh >/dev/null 2>&1 ||
-            { echo 'Isolated offline execution failed'; exit 1; }
-      - name: Return verified output to private storage
+            { echo 'Isolated transcribe failed'; exit 1; }
+      - name: 03–04 · Verify aligned captions, prepare 3D assets, compose scenes and brand CTA
+        id: prepare
+        if: ${{ steps.metadata.outputs.operation == 'prepare' }}
+        run: |
+          umask 077
+          bash engine/github_render_sandbox.sh >/dev/null 2>&1 ||
+            { echo 'Isolated prepare failed'; exit 1; }
+      - name: 05–06 · HyperFrames capture, FFmpeg encoding, output verification and CapCut exports
+        id: capture
+        if: ${{ steps.metadata.outputs.operation == 'render' }}
+        run: |
+          umask 077
+          bash engine/github_render_sandbox.sh >/dev/null 2>&1 ||
+            { echo 'Isolated render failed'; exit 1; }
+      - name: 07 · Transfer verified output to private storage
+        id: delivery
         if: ${{ !inputs.probe }}
         env:
           GH_TOKEN: ${{ secrets.VRS_PRIVATE_TRANSFER_TOKEN }}
@@ -182,7 +210,51 @@ jobs:
           mkdir "$VRS_JOB"
           python3 engine/github_production.py probe "$VRS_JOB" >/dev/null 2>&1 ||
             { echo 'Restricted transfer check failed'; exit 1; }
-      - name: Remove runner media
+      - name: Summarize completed work without private content
+        if: ${{ always() && !inputs.probe }}
+        env:
+          TRANSCRIBE: ${{ steps.transcribe.outcome }}
+          PREPARE: ${{ steps.prepare.outcome }}
+          CAPTURE: ${{ steps.capture.outcome }}
+          DELIVERY: ${{ steps.delivery.outcome }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+          from pathlib import Path
+          delivery = Path(os.environ.get("VRS_JOB", "/nonexistent")) / "delivery"
+          for key, title in [
+              ("TRANSCRIBE", "02 · Speech recognition and recovery"),
+              ("PREPARE", "03–04 · Caption readiness, assets, composition and branding"),
+              ("CAPTURE", "05–06 · Video capture, encoding and verified companion files"),
+              ("DELIVERY", "07 · Private output transfer"),
+          ]:
+              status = os.environ.get(key)
+              if status in {"success", "failure", "cancelled", "skipped"}:
+                  print(f"- {title}: **{status}**")
+          for operation, keys in {
+              "transcribe": ("transcribeSeconds", "wordCount"),
+              "prepare": ("prepareSeconds", "modelsRequired", "modelsPrepared", "modelsReused"),
+              "render": ("captureSeconds", "encodingSeconds", "duration", "frames", "cpus"),
+          }.items():
+              path = delivery / f"{operation}-metrics.json"
+              if not path.is_file():
+                  continue
+              metrics = json.loads(path.read_text())
+              model = metrics.get("model")
+              if model in {"tiny.en", "small", "apex-ct2-int8"}:
+                  print(f"- Transcription model: {model}. Caption acceptance is checked by the dashboard.")
+              for key in keys:
+                  if type(metrics.get(key)) in {float, int}:
+                      print(f"- {key}: {metrics[key]}")
+          EOF
+      - name: 07 · Remove runner media and verify cleanup
         if: always()
         run: |
-          if test -n "${VRS_JOB:-}"; then rm -rf -- "$VRS_JOB"; fi
+          if test -n "${VRS_JOB:-}"; then
+            rm -rf -- "$VRS_JOB"
+            test ! -e "$VRS_JOB"
+          fi
+          rm -rf -- "$RUNNER_TEMP/vrs-models" "$RUNNER_TEMP/vrs-apex-hf"
+          test ! -e "$RUNNER_TEMP/vrs-models" && test ! -e "$RUNNER_TEMP/vrs-apex-hf"
+          echo '- Runner scratch and model files removed.' >> "$GITHUB_STEP_SUMMARY"

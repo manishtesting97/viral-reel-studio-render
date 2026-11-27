@@ -393,7 +393,7 @@ def receive_preparation(receipt, run, root, limit):
     return prepared, metrics
 
 
-def runner_fetch(job, request):
+def runner_fetch(job, request, expected_operation=None, expected_recovery=None, *, metadata_only=False):
     check_repo(runner=True)
     name = tag(request)
     matches = [draft for draft in api(f"{BASE}/releases?per_page=100", runner=True)
@@ -413,6 +413,16 @@ def runner_fetch(job, request):
             or assets[0]["digest"] != "sha256:" + checksum
             or assets[0]["state"] != "uploaded" or not 0 < assets[0]["size"] <= LIMIT):
         raise ValueError("Private input release does not match the production dispatch.")
+    if operation not in {"transcribe", "prepare", "render"}:
+        raise ValueError("Unsupported hybrid workflow operation.")
+    recovery = descriptor.get("recovery", False)
+    if type(recovery) is not bool or (recovery and operation != "transcribe"):
+        raise ValueError("Invalid recovery mode.")
+    if metadata_only:
+        print(f"operation={operation}\nrecovery={str(recovery).lower()}")
+        return
+    if expected_operation is not None and (operation, str(recovery).lower()) != (expected_operation, expected_recovery):
+        raise ValueError("Private draft operation changed after prerequisite selection.")
     asset_id = assets[0]["id"]
     job.mkdir(mode=0o700)
     archive = job / ASSET
@@ -429,6 +439,7 @@ def runner_fetch(job, request):
                 or data["language"] != descriptor.get("language")
                 or data["revision"] != descriptor.get("revision")
                 or "voice.wav" not in data["files"]
+                or ("recovery.json" in data["files"]) != recovery
                 or any(name not in {"voice.wav", "recovery.json"} for name in data["files"])):
             raise ValueError("Private production package is missing required transcription inputs.")
     elif operation == "prepare":
@@ -706,6 +717,9 @@ def _prepare_workspace(job):
 
     manifest_bytes = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
     (delivery / "prepare-manifest.json").write_bytes(manifest_bytes)
+    prepared_models = sum(scene["component"] == "procedural-model" for scene in result["generated"])
+    active_models = sum(scene["component"] == "procedural-model" and scene["status"] == "auto-generated"
+                        for scene in result["status"]["scenes"])
     metrics = {
         "manifest": transfer["manifest"],
         "inputSha": transfer["inputSha"],
@@ -716,6 +730,9 @@ def _prepare_workspace(job):
         "mode": transfer.get("mode"),
         "sceneId": transfer.get("sceneId"),
         "scenesGenerated": len(result["generated"]),
+        "modelsRequired": sum("model" in scene.get("storyboard", {}) for scene in plan["scenes"]),
+        "modelsPrepared": prepared_models,
+        "modelsReused": max(0, active_models - prepared_models),
         "validation": result["validation"],
         "prepareSeconds": elapsed,
         "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
@@ -881,6 +898,8 @@ if __name__ == "__main__":
     try:
         if mode == "fetch":
             runner_fetch(Path(folder), *args)
+        elif mode == "metadata":
+            runner_fetch(Path(folder), *args, metadata_only=True)
         elif mode == "execute":
             runner_execute(Path(folder))
         elif mode == "_prepare":

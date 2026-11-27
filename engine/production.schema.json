@@ -1,5 +1,214 @@
 {
   "$defs": {
+    "visualModel": {
+      "type": "object",
+      "properties": {
+        "groundShadows": {"type": "boolean"},
+        "parts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "fixed": {"type": "boolean"},
+              "id": {
+                "$ref": "#/$defs/visualId"
+              },
+              "shape": {
+                "enum": [
+                  "box",
+                  "sphere",
+                  "cylinder",
+                  "torus",
+                  "loft",
+                  "tube"
+                ]
+              },
+              "size": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": 0.015,
+                  "maximum": 16
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "color": {
+                "type": "string",
+                "minLength": 7,
+                "maxLength": 7,
+                "pattern": "^#[A-Fa-f0-9]{6}$"
+              },
+              "position": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": -24,
+                  "maximum": 24
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "rotation": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": -360,
+                  "maximum": 360
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "metalness": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 0.85
+              },
+              "roughness": {
+                "type": "number",
+                "minimum": 0.22,
+                "maximum": 1
+              },
+              "opacity": {
+                "type": "number",
+                "minimum": 0.15,
+                "maximum": 1
+              },
+              "sections": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": -8,
+                    "maximum": 8
+                  },
+                  "minItems": 5,
+                  "maxItems": 5
+                },
+                "minItems": 2,
+                "maxItems": 18
+              },
+              "points": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "items": {
+                    "type": "number",
+                    "minimum": -24,
+                    "maximum": 24
+                  },
+                  "minItems": 3,
+                  "maxItems": 3
+                },
+                "minItems": 2,
+                "maxItems": 16
+              },
+              "texture": {
+                "enum": [
+                  "matte",
+                  "brushed",
+                  "rubber"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "shape",
+              "size",
+              "color"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 1,
+          "maxItems": 48
+        },
+        "eye": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": -24,
+            "maximum": 24
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "look": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": -24,
+            "maximum": 24
+          },
+          "minItems": 3,
+          "maxItems": 3
+        },
+        "fov": {
+          "type": "number",
+          "minimum": 25,
+          "maximum": 54
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "target": {
+                "$ref": "#/$defs/visualId"
+              },
+              "action": {
+                "enum": [
+                  "reveal",
+                  "move",
+                  "rotate",
+                  "camera"
+                ]
+              },
+              "anchor": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "value": {
+                "type": "array",
+                "items": {
+                  "type": "number",
+                  "minimum": -360,
+                  "maximum": 360
+                },
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "duration": {
+                "type": "number",
+                "minimum": 0.1,
+                "maximum": 4
+              },
+              "occurrence": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20
+              }
+            },
+            "required": [
+              "target",
+              "action",
+              "anchor",
+              "value"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 0,
+          "maxItems": 24
+        }
+      },
+      "required": [
+        "parts",
+        "eye",
+        "look"
+      ],
+      "additionalProperties": false
+    },
     "visualId": {"type": "string", "minLength": 1, "maxLength": 48, "pattern": "^[a-z][a-z0-9-]{0,47}$"},
     "paint": {"type": "string", "minLength": 1, "maxLength": 16, "pattern": "^(?:#[a-fA-F0-9]{6}|none|ink|accent|surface|border)$"},
     "visualShape": {
@@ -274,6 +483,7 @@
                 "maxItems": 20
               },
               "events": {"$ref": "#/$defs/motionEvents"},
+              "model": {"$ref": "#/$defs/visualModel"},
               "limitation": {"type": "string", "minLength": 1, "maxLength": 240},
               "artwork": {
                 "type": "object",

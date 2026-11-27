@@ -56,6 +56,64 @@ def _phrase_starts(tokens, phrase):
     return [i for i in range(len(tokens)) if tokens[i:i + len(phrase)] == phrase]
 
 
+def validate_model(scene):
+    storyboard = scene.get("storyboard", {})
+    model = storyboard.get("model")
+    if model is None:
+        return
+    from production_plan import SCHEMA, load, validate
+
+    schema = load(SCHEMA)
+    sid = scene["id"]
+    validate(model, schema["$defs"]["visualModel"], f"{sid}.storyboard.model", schema=schema)
+    if storyboard.get("limitation"):
+        raise ValueError(f"{sid}: a procedural model and an unsupported requirement cannot both be selected.")
+    ids = {part["id"] for part in model["parts"]}
+    if ids & {"camera", "assembly"} or len(ids) != len(model["parts"]):
+        raise ValueError(f"{sid}: model part IDs must be unique and cannot use camera or assembly.")
+    if sum((a-b)**2 for a,b in zip(model["eye"], model["look"])) < 1:
+        raise ValueError(f"{sid}: the camera must be at least one unit from its subject.")
+    for part in model["parts"]:
+        if part["shape"] == "loft":
+            rings = part.get("sections", [])
+            if (len(rings) < 2 or any(min(ring[3:]) < .005 for ring in rings)
+                    or any(a[0] >= b[0] for a,b in zip(rings, rings[1:]))):
+                raise ValueError(f"{sid}: loft {part['id']} needs increasing cross sections with positive radii.")
+        elif "sections" in part:
+            raise ValueError(f"{sid}: sections apply to loft geometry.")
+        points = part.get("points", [])
+        if part["shape"] == "torus" and part["size"][0] <= 2*part["size"][2]:
+            raise ValueError(f"{sid}: torus diameter must be more than twice its tube diameter.")
+        if part["shape"] == "tube":
+            if len(points) < 2 or any(a == b for a,b in zip(points, points[1:])):
+                raise ValueError(f"{sid}: tube {part['id']} needs distinct successive points.")
+        elif points:
+            raise ValueError(f"{sid}: points apply to tube geometry.")
+    tokens = _tokenize(scene["narration"])
+    for event in model.get("events", []):
+        targets = {"camera"} if event["action"] == "camera" else ids | {"assembly"}
+        if event["target"] not in targets or (event["action"] == "reveal" and event["target"] == "assembly"):
+            raise ValueError(f"{sid}: unknown procedural model target {event['target']}.")
+        if event["action"] != "rotate" and max(map(abs, event["value"])) > 24:
+            raise ValueError(f"{sid}: model event position exceeds the scene bounds.")
+        if event["action"] == "camera" and sum((a-b)**2 for a,b in zip(event["value"], model["look"])) < 1:
+            raise ValueError(f"{sid}: camera destination is too close to the subject.")
+        phrase = _tokenize(event["anchor"])
+        if not phrase or len(_phrase_starts(tokens, phrase)) < event.get("occurrence", 1):
+            raise ValueError(f"{sid}: model cue {event['anchor']!r} is missing from narration.")
+
+
+def model_events(scene, words, start, duration):
+    events = []
+    for event in scene["storyboard"]["model"].get("events", []):
+        at = resolve_anchor_time(event["anchor"], words, scene["narration"], start, duration,
+                                 exact=True, occurrence=event.get("occurrence", 1))
+        if at is None or at >= duration:
+            raise ValueError(f"{scene['id']}: model cue {event['anchor']!r} has no aligned onset.")
+        events.append({**event, "at": at, "duration": min(event.get("duration", .6), duration-at)})
+    return sorted(events, key=lambda event: event["at"])
+
+
 def validate_artwork(scene):
     storyboard = scene.get("storyboard", {})
     artwork = storyboard.get("artwork")
