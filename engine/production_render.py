@@ -222,6 +222,8 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
     if re.fullmatch(r"#[\da-fA-F]{6}", highlight):
         variables += f";--brand-highlight:{highlight}"
     visual = {**style.get("layout", {}), **brand.get("layout", {})}
+    caption_size, caption_margin = caption_geometry(brand, style)
+    variables += f";--vrs-caption-clearance:{caption_size + caption_margin + 36}px"
     for setting, token in {"headerTop":"header-top", "headerLeft":"header-left",
                            "headerSize":"header-size", "stageTop":"stage-top",
                            "headingSize":"heading-size", "headingSpacing":"heading-spacing",
@@ -374,14 +376,20 @@ def _pill_ass_path(w, h, r=14):
     )
 
 
+def caption_geometry(brand, style):
+    caption = brand.get("captions", {})
+    size = min(84, max(36, int(caption.get("size", style.get("typography", {}).get("captionSizePx", 52)))))
+    margin = min(900, max(260, int(caption.get("marginBottom", style.get("captions", {}).get("marginBottom", 690)))))
+    return size, margin
+
+
 def subtitles(folder, plan, words, dark_scenes=None, *, project=None):
     brand, style = profiles(plan, project=project)
     dark_scenes = set(dark_scenes or ())
     caption = brand.get("captions", {})
     words_per_group = min(6, max(1, int(caption.get("wordsPerGroup",
                           style.get("captions", {}).get("wordsPerGroup", 4)))))
-    font_size = min(84, max(36, int(caption.get("size", style.get("typography", {}).get("captionSizePx", 52)))))
-    margin_v = min(900, max(260, int(caption.get("marginBottom", style.get("captions", {}).get("marginBottom", 690)))))
+    font_size, margin_v = caption_geometry(brand, style)
     use_box = bool(caption.get("box", style.get("captions", {}).get("box", True)))
     use_highlighter = bool(caption.get("highlighter", False)) and not use_box
     adaptive = use_highlighter and (

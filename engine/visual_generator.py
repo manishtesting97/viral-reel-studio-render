@@ -11,7 +11,7 @@ import subprocess
 import time
 
 import asset_library
-from motion_choreography import compile_scene_storyboard
+from motion_choreography import compile_scene_storyboard, validate_artwork
 from production_plan import BRAND_DIR, STYLE_LIB, digest, load, profiles, save, write
 import production_render
 import sponsorship
@@ -146,6 +146,10 @@ COMMON_CSS = """/* Auto-generated universal editorial scene stylesheet inheritin
   display: flex;
   flex-direction: column;
   gap: var(--vrs-visual-gap);
+}
+.vrs-artwork-layout {
+  bottom: max(550px, var(--vrs-caption-clearance, 550px));
+  gap: min(64px, var(--vrs-visual-gap));
 }
 .vrs-auto-heading {
   flex: none;
@@ -739,7 +743,11 @@ def select_component(
     blob = f"{sid} {heading} {desc} {narr}"
 
     if assignment and assignment.get("layers") and assignment.get("mode") in {"hybrid", "image", "video"}:
+        if "artwork" in scene.get("storyboard", {}) and assignment["mode"] == "hybrid":
+            return "semantic-artwork"
         return "media_spotlight"
+    if "artwork" in scene.get("storyboard", {}):
+        return "semantic-artwork"
 
     if index + 1 == total and any(k in blob for k in ("follow", "cta", "subscribe", "outro", "creator", "handle", "@")):
         return "creator_cta_outro"
@@ -869,6 +877,46 @@ def _format_heading_html(heading: str) -> str:
     return f"<em>{escape(clean)}</em>"
 
 
+def _artwork_markup(storyboard):
+    """Draw only the locally validated shapes authored by the production agent."""
+    layers = []
+    initially_hidden = {}
+    for event in storyboard["events"]:
+        initially_hidden.setdefault(event["target"], event["action"] in {"reveal", "type", "connect"})
+        if event["action"] == "transform":
+            initially_hidden.setdefault(event["value"], True)
+    paints = {"ink": "var(--brand-ink, #181412)", "accent": "var(--brand-accent, #ea580c)",
+              "surface": "var(--style-surface, #ffffff)", "border": "var(--style-border, #e5dbd0)"}
+    for layer in storyboard["artwork"]["layers"]:
+        marks = []
+        for shape in layer["shapes"]:
+            kind = shape["type"]
+            fill = shape.get("fill", "none" if kind == "path" and "stroke" in shape else "ink")
+            stroke = shape.get("stroke", "none")
+            attrs = (f'fill="{paints.get(fill, fill)}" stroke="{paints.get(stroke, stroke)}" '
+                     f'stroke-width="{shape.get("strokeWidth", 1)}" stroke-linejoin="round" stroke-linecap="round"')
+            if kind == "path":
+                marks.append(f'<path d="{escape(shape["d"])}" {attrs}/>')
+                continue
+            x, y, w, h = shape["box"]
+            bounds = f'x="{x}" y="{y}" width="{w}" height="{h}"'
+            if kind == "rect":
+                marks.append(f'<rect {bounds} rx="{shape.get("radius", 0)}" {attrs}/>')
+            elif kind == "ellipse":
+                marks.append(f'<ellipse cx="{x+w/2}" cy="{y+h/2}" rx="{w/2}" ry="{h/2}" {attrs}/>')
+            elif kind == "text":
+                marks.append(f'<text x="{x}" y="{y}" dominant-baseline="hanging" font-size="{shape["size"]}" '
+                             f'font-weight="700" {attrs}>{escape(shape["text"])}</text>')
+            else:
+                marks.append(f'<image href="assets/{escape(shape["asset"])}" {bounds}/>')
+        opacity = 0 if initially_hidden.get(layer["id"]) else 1
+        layers.append(f'<g data-ev="{layer["id"]}" opacity="{opacity}">{"".join(marks)}</g>')
+    return ('<div class="vrs-auto-stage" style="height:auto;flex:1">'
+            '<svg class="vrs-semantic-artwork" width="100%" height="100%" viewBox="0 0 944 760" '
+            'aria-hidden="true" style="flex:1;min-height:0;overflow:hidden">'
+            + "".join(layers) + '</svg></div>')
+
+
 def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard: dict | None = None) -> str:
     sid_js = json.dumps(sid)
     beats_js = json.dumps([{"id": b["id"], "start": float(b["start"]), "end": float(b["end"])} for b in beats])
@@ -930,9 +978,42 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
     }});
     const cur = root.querySelector(".vrs-cursor-ptr");
     if (cur) tl.set(cur, {{opacity:0}}, scene.start);
+    const artwork = root.querySelector(".vrs-semantic-artwork");
     evList.forEach((ev) => {{
       const el = root.querySelector('[data-ev="' + ev.target + '"]');
       if (!el) return;
+      if (artwork) {{
+        const t = scene.start + ev.at;
+        const duration = ev.duration;
+        if (ev.action === "transform") {{
+          const destination = artwork.querySelector('[data-ev="' + ev.value + '"]');
+          tl.to(el, {{opacity:0, duration}}, t);
+          tl.to(destination, {{opacity:1, duration}}, t);
+        }} else if (ev.action === "connect") {{
+          tl.set(el, {{opacity:1}}, t);
+          el.querySelectorAll('path:not([stroke="none"])').forEach(path => {{
+            const length = path.getTotalLength();
+            tl.fromTo(path, {{strokeDasharray:length, strokeDashoffset:length}},
+              {{strokeDashoffset:0, duration, ease:"power2.inOut", immediateRender:false}}, t);
+          }});
+        }} else if (ev.action === "type") {{
+          tl.set(el, {{opacity:1}}, t);
+          tl.fromTo(el, {{clipPath:"inset(0 100% 0 0)"}},
+            {{clipPath:"inset(0 0 0 0)", duration, ease:"steps(16)", immediateRender:false}}, t);
+        }} else if (ev.action === "highlight") {{
+          tl.to(el, {{scale:1.08, transformOrigin:"50% 50%", duration:duration/2, yoyo:true, repeat:1}}, t);
+        }} else if (ev.action === "focus") {{
+          const box = el.getBBox();
+          const x = gsap.utils.clamp(0, 104, box.x + box.width/2 - 420);
+          const y = gsap.utils.clamp(0, 84, box.y + box.height/2 - 338);
+          tl.fromTo(artwork, {{attr:{{viewBox:"0 0 944 760"}}}},
+            {{attr:{{viewBox:x+" "+y+" 840 676"}}, duration:duration/2, yoyo:true, repeat:1,
+              ease:"power2.inOut", immediateRender:false}}, t);
+        }} else {{
+          tl.to(el, {{opacity:ev.action === "exit" ? 0 : 1, duration, ease:"power2.out"}}, t);
+        }}
+        return;
+      }}
       const relAt = Math.max(0.04, Math.min(sceneDur - 0.16, Number(ev.at) || 0.18));
       const tEv = scene.start + relAt;
       const dEv = Math.max(0.18, Number(ev.duration) || 0.38);
@@ -1515,7 +1596,9 @@ def _render_component_html_and_js(
     narr = scene.get("narration") or ""
     blob_low = f"{sid} {heading} {desc} {narr}".lower()
     s_start = float(scene.get("start", 0) if actual_start is None else actual_start)
-    s_dur = max(1.2, float((scene.get("end", 5) - scene.get("start", 0)) if actual_dur is None else actual_dur))
+    s_dur = float((scene.get("end", 5) - scene.get("start", 0)) if actual_dur is None else actual_dur)
+    if component != "semantic-artwork":
+        s_dur = max(1.2, s_dur)
     storyboard = compile_scene_storyboard(
         scene,
         component,
@@ -1542,7 +1625,9 @@ def _render_component_html_and_js(
     extra_js = ""
     is_git_ctx = any(k in blob_low for k in ("git", "github", "commit", "repository", "pull request"))
 
-    if component == "comparison_split":
+    if component == "semantic-artwork":
+        body = _artwork_markup(storyboard)
+    elif component == "comparison_split":
         entities = [str(e).strip() for e in (storyboard.get("entities") or []) if str(e).strip()]
         lbl_left, lbl_right = _pick_summary_labels(f"{heading}. {desc}")
         if "git ≠" in heading.lower() or ("git" in heading.lower() and "github" in blob_low and "version control" not in heading.lower()):
@@ -2204,12 +2289,13 @@ def _render_component_html_and_js(
           <div style="height:10px;background:#ece4da;border-radius:999px;overflow:hidden"><div class="js-bar" data-width="100%" style="height:100%;background:{accent};border-radius:999px"></div></div>
         </div>"""
 
+    layout = "vrs-auto-layout vrs-artwork-layout" if component == "semantic-artwork" else "vrs-auto-layout"
     html_doc = f"""<link rel="stylesheet" href="assets/vrs-auto.css" />
 <div class="vrs-auto-scene">
   <div class="vrs-auto-bg"></div>
   <div class="vrs-progress-rail"><div class="vrs-progress-fill"></div></div>
   <div class="vrs-meta-badge"></div>
-  <div class="vrs-auto-layout">
+  <div class="{layout}">
     {heading_html}
     {body}
   </div>
@@ -2221,11 +2307,12 @@ def _render_component_html_and_js(
 
 def _stage_declared_scene_assets(plan: dict, brand: dict, assets_dir: Path, creator_photo: Path | None) -> str:
     font_css = ""
-    noto_serif = Path("/usr/share/fonts/truetype/noto/NotoSerif-BoldItalic.ttf")
-    if noto_serif.is_file():
-        fonts_dst = assets_dir / "fonts"
-        fonts_dst.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(noto_serif, fonts_dst / "NotoSerif-BoldItalic.ttf")
+    noto_src = Path("/usr/share/fonts/truetype/noto/NotoSerif-BoldItalic.ttf")
+    noto_dst = assets_dir / "fonts" / "NotoSerif-BoldItalic.ttf"
+    if noto_src.is_file() and not noto_dst.is_file():
+        noto_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(noto_src, noto_dst)
+    if noto_dst.is_file():
         font_css += (
             '@font-face{font-family:"Noto Serif";src:url("fonts/NotoSerif-BoldItalic.ttf") '
             'format("truetype");font-weight:700;font-style:italic;}\n'
@@ -2288,21 +2375,29 @@ def validate_visual_sources(
     except ValueError as err:
         issues.append(str(err))
 
+    cfg = cfg if cfg is not None else load_visual_config(project)
     js_files: list[Path] = []
     for scene in plan.get("scenes", []):
         sid = scene["id"]
         if assignments.get(sid, {}).get("mode") in {"image", "video"}:
             continue
         html_path = source_dir / "scenes" / f"{sid}.html"
+        js_path = source_dir / "assets" / f"{sid}.js"
         if html_path.is_file():
             raw_html = html_path.read_text(encoding="utf-8", errors="replace")
+            storyboard = scene.get("storyboard", {})
+            scene_mode = cfg.get("scenes", {}).get(sid, {}).get("mode", cfg.get("mode", "auto"))
+            if scene_mode != "custom":
+                if storyboard.get("limitation"):
+                    issues.append(f"{sid}: {storyboard['limitation']} Use supplied media or a reviewed custom scene.")
+                elif "artwork" in storyboard and ('class="vrs-semantic-artwork"' not in raw_html or not js_path.is_file()):
+                    issues.append(f"{sid}: automatic scene is missing its narration-driven artwork. Prepare it again.")
             if FORBIDDEN_EXT_URLS.search(raw_html):
                 issues.append(f"{sid}.html references an external network URL.")
             if SECRET_LEAK.search(raw_html):
                 issues.append(f"{sid}.html contains sensitive credential patterns.")
             if re.search(r"<audio\b", raw_html, re.I):
                 issues.append(f"{sid}.html must not embed voice/audio tags.")
-        js_path = source_dir / "assets" / f"{sid}.js"
         if js_path.is_file():
             raw_js = js_path.read_text(encoding="utf-8", errors="replace")
             if FORBIDDEN_JS.search(raw_js) or FORBIDDEN_EXT_URLS.search(raw_js):
@@ -2384,6 +2479,8 @@ def complete_visual_prompt(project: Path, plan: dict | None = None, timing: dict
         ])
         if scene_asset_cfg:
             lines.append(f"- Assigned Library Media ({scene_asset_cfg['mode']}): {json.dumps(scene_asset_cfg['layers'], ensure_ascii=False)}")
+        if scene.get("storyboard"):
+            lines.append(f"- Storyboard: {json.dumps(scene['storyboard'], ensure_ascii=False)}")
 
     prompt_text = "\n".join(lines) + "\n"
     write(project / "visual-production-prompt.txt", prompt_text)
@@ -2540,6 +2637,20 @@ def generate_visuals(
     cfg["mode"] = proj_mode
     cfg.setdefault("scenes", {})
 
+    active_timing = timeline if timing_is_measured else None
+    entries = _resolve_scene_plan(plan, brief, brand, style, active_timing, assignments, cfg, proj_mode, scene_id=scene_id)
+    for item in entries:
+        if ((scene_id and item["id"] != scene_id)
+                or (item["sceneMode"] == "custom" and not force)
+                or (item["assign"] or {}).get("mode") in {"image", "video"}):
+            continue
+        storyboard = item["scene"].get("storyboard", {})
+        if storyboard.get("limitation"):
+            raise ValueError(f"{item['id']}: {storyboard['limitation']} Use supplied media or a reviewed custom scene.")
+        validate_artwork(item["scene"])
+        if item["component"] == "semantic-artwork" and active_timing and not item["words"] and storyboard["artwork"].get("events"):
+            raise ValueError(f"{item['id']}: approved narration timings are missing for the artwork.")
+
     source_dir = project / "visuals"
     scenes_dir = source_dir / "scenes"
     assets_dir = source_dir / "assets"
@@ -2548,18 +2659,18 @@ def generate_visuals(
 
     # Write shared stylesheet and stage safe project-declared local assets (engine injects gsap/three vendors)
     font_css = _stage_declared_scene_assets(plan, brand, assets_dir, creator_photo)
-    write(assets_dir / "vrs-auto.css", font_css + COMMON_CSS)
+    body_css = COMMON_CSS if font_css else COMMON_CSS.replace('"Noto Serif", ', '')
+    write(assets_dir / "vrs-auto.css", font_css + body_css)
 
     generated_scenes: list[dict] = []
-    active_timing = timeline if timing_is_measured else None
-    for item in _resolve_scene_plan(plan, brief, brand, style, active_timing, assignments, cfg, proj_mode, scene_id=scene_id):
+    for item in entries:
         scene, sid = item["scene"], item["id"]
         saved_meta, scene_mode, assign = item["savedMeta"], item["sceneMode"], item["assign"]
         component, actual, scene_words, seed = item["component"], item["actual"], item["words"], item["seed"]
 
         if scene_id and sid != scene_id:
             continue
-        if scene_mode == "custom" and not force and (scenes_dir / f"{sid}.html").is_file():
+        if scene_mode == "custom" and not force:
             cfg["scenes"][sid] = {**saved_meta, "mode": "custom"}
             continue
         if (not force and scene_id is None and saved_meta.get("status") == "auto_generated"
@@ -2572,7 +2683,7 @@ def generate_visuals(
             continue
 
         actual_start = float(actual["start"])
-        actual_dur = max(1.0, float(actual["end"]) - actual_start)
+        actual_dur = float(actual["end"]) - actual_start
         html_doc, js_doc, storyboard = _render_component_html_and_js(
             component,
             scene,

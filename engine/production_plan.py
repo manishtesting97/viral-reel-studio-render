@@ -49,10 +49,17 @@ def digest(*inputs):
 
 
 def timing_key(voice, plan):
-    # Timing is tied to the recorded voice and clean scene plan.
+    # Artwork can be revised independently of approved narration and caption evidence.
     base = {key: value for key, value in plan.items() if key != "badge"}
-    base["scenes"] = [{key: value for key, value in scene.items() if key != "voice_direction"}
-                      for scene in plan["scenes"]]
+    base["scenes"] = []
+    for scene in plan["scenes"]:
+        row = {key: value for key, value in scene.items() if key != "voice_direction"}
+        if {"artwork", "limitation"} & row.get("storyboard", {}).keys():
+            storyboard = {key: value for key, value in row.pop("storyboard").items()
+                          if key not in {"artwork", "limitation"}}
+            if storyboard:
+                row["storyboard"] = storyboard
+        base["scenes"].append(row)
     return digest(voice, base)
 
 
@@ -77,8 +84,11 @@ def timing_is_current(timeline, voice, plan):
             and current_alignment_report(voice, plan, key).get("status") not in {"failed", "running"})
 
 
-def validate(value, rule, path="$"):
+def validate(value, rule, path="$", *, schema=None):
     """Evaluate the JSON Schema keywords used in the versioned contract."""
+    schema = rule if schema is None else schema
+    if "$ref" in rule:
+        rule = schema["$defs"][rule["$ref"].removeprefix("#/$defs/")]
     kind = rule.get("type")
     valid = {
         "object": type(value) is dict,
@@ -97,18 +107,18 @@ def validate(value, rule, path="$"):
             raise ValueError(f"{path}: missing {sorted(req - value.keys())}, "
                              f"unknown {sorted(value.keys() - set(rule['properties']))}")
         for key, item in value.items():
-            validate(item, rule["properties"][key], f"{path}.{key}")
+            validate(item, rule["properties"][key], f"{path}.{key}", schema=schema)
     elif kind == "array":
         if not rule["minItems"] <= len(value) <= rule["maxItems"]:
             raise ValueError(f"{path}: invalid item count")
         for index, item in enumerate(value):
-            validate(item, rule["items"], f"{path}[{index}]")
+            validate(item, rule["items"], f"{path}[{index}]", schema=schema)
     elif kind == "string":
         if not value.strip() or not rule["minLength"] <= len(value) <= rule["maxLength"]:
             raise ValueError(f"{path}: invalid text length")
         if "pattern" in rule and not re.fullmatch(rule["pattern"], value):
             raise ValueError(f"{path}: invalid identifier or relative asset path")
-    elif kind == "number" and not rule["minimum"] <= value <= rule["maximum"]:
+    elif kind in {"number", "integer"} and not rule.get("minimum", -math.inf) <= value <= rule.get("maximum", math.inf):
         raise ValueError(f"{path}: out of range")
 
 
@@ -166,9 +176,23 @@ def production_prompt(project, config, badge=None):
           "Keep the spoken wording identical and never put tags in narration. "
           "Specify original scene-specific visuals; use the style profile as art direction and "
           "the brand profile as identity. Asset entries are local relative filenames, never URLs. "
-          "Optionally populate each scene's `storyboard` with purpose, composition, semantic entities, "
-          "UI elements, narration word/phrase anchors, and motion events (reveal, type, click, drag, "
-          "connect, count, highlight, transform, confirm, reject, restore, compare, exit) timed to spoken words. "
+          "For every explanatory scene supply `storyboard.artwork` with named layers of shapes that actually depict "
+          "the objects, interfaces and relationships spoken about. Draw on a 944 by 760 canvas inside the safe zone. "
+          "Shapes are rect, ellipse, path, text and image. Use box [x,y,width,height] for rect, ellipse and image. "
+          "For text use box [x,y,0,0] (top-left), text and size. For paths supply SVG path data d. "
+          "Use fill and stroke as hex colors or ink, accent, surface, border or none. Images must reference a real "
+          "local raster file listed in the scene's assets. Layer order is back to front. "
+          "In artwork.events target a layer ID and quote the exact spoken anchor, with occurrence for repeated phrases. "
+          "Use a few meaningful reveals, highlights, exits, typed text, drawn connections or transforms. "
+          "A transform's value is the destination layer ID. The destination stays hidden until the swap. "
+          "Use highlight for brief object emphasis or focus for a bounded camera push-in. "
+          "Use an explicit scene-relative at only for an unspoken beat. "
+          "Compose original diagrams, illustrations or interface details. Draw the mechanism and its state changes "
+          "with purposeful labels. Omit decorative metrics, filler cards and unrelated symbols. "
+          "If a scene needs true 3D or missing assets and cannot be illustrated faithfully, set storyboard.limitation "
+          "to the specific requirement instead of artwork. This stops automatic substitution and permits supplied media "
+          "or a reviewed custom scene. "
+          "For a visual-only revision of a recorded plan, change artwork only to retain approved timing. "
           "Do not fabricate product screenshots, medical claims, metrics or unsupported facts.\n\n"
           + json.dumps({"brief": config, "brand": brand, "referenceStyle": style,
                         **({"badge": badge} if badge else {}),
@@ -199,6 +223,8 @@ def save_director(project, plan, selected, edited=None):
 
 
 def import_plan(project, plan):
+    from motion_choreography import validate_artwork
+
     validate(plan, load(SCHEMA))
     brief = load(project / "brief.json")
     if any(plan[key] != brief[key] for key in CONFIG):
@@ -207,6 +233,7 @@ def import_plan(project, plan):
     scene_ids, audio_ids = {"production", "stage"}, set()
     for scene in plan["scenes"]:
         validate_scene(scene)
+        validate_artwork(scene)
         sid = scene["id"]
         if sid in scene_ids or not math.isclose(scene["start"], expected, abs_tol=1e-6):
             raise ValueError(f"{sid}: duplicate ID or discontinuous scene timeline.")

@@ -20,6 +20,9 @@ SEMANTIC_ACTIONS = (
 )
 
 _TOKEN_RE = re.compile(r"[^\W_][\w\u0900-\u097f']*", re.UNICODE)
+ARTWORK_ACTIONS = {"reveal", "type", "connect", "highlight", "focus", "transform", "exit"}
+_PATH_TOKEN = re.compile(r"[A-Za-z]|[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
+_PATH_ARITY = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2, "A": 7, "Z": 0}
 
 
 def _norm(token: str) -> str:
@@ -28,6 +31,91 @@ def _norm(token: str) -> str:
 
 def _tokenize(text: str) -> list[str]:
     return [_norm(m.group(0)) for m in _TOKEN_RE.finditer(text or "") if _norm(m.group(0))]
+
+
+def _path_valid(path):
+    for match in re.finditer(r"([A-Za-z])([^A-Za-z]*)", path):
+        command, tail = match.groups()
+        arity = _PATH_ARITY[command.upper()]
+        coords = _PATH_TOKEN.findall(tail)
+        if not arity:
+            if tail.strip():
+                return False
+            continue
+        if (not coords or len(coords) % arity or _PATH_TOKEN.sub("", tail).strip(" ,")
+                or any(abs(float(v)) > 1888 for v in coords)):
+            return False
+        if command.upper() == "A" and any(
+            coords[i + j] not in {"0", "1"} for i in range(0, len(coords), 7) for j in (3, 4)
+        ):
+            return False
+    return True
+
+
+def _phrase_starts(tokens, phrase):
+    return [i for i in range(len(tokens)) if tokens[i:i + len(phrase)] == phrase]
+
+
+def validate_artwork(scene):
+    storyboard = scene.get("storyboard", {})
+    artwork = storyboard.get("artwork")
+    if artwork is None:
+        return
+    if storyboard.get("limitation"):
+        raise ValueError(f"{scene['id']}: provide artwork or a limitation, not both.")
+    from production_plan import SCHEMA, load, validate
+
+    schema = load(SCHEMA)
+    rule = schema["properties"]["scenes"]["items"]["properties"]["storyboard"]["properties"]["artwork"]
+    sid = scene["id"]
+    validate(artwork, rule, f"{sid}.storyboard.artwork", schema=schema)
+    if scene["visual"]["type"] in {"three", "canvas"}:
+        raise ValueError(f"{sid}: this artwork uses SVG. Use supplied media or a reviewed composition for true 3D or canvas.")
+    layers = {layer["id"]: layer["shapes"] for layer in artwork["layers"]}
+    if len(layers) != len(artwork["layers"]):
+        raise ValueError(f"{sid}: artwork layer IDs must be unique.")
+    for shapes in layers.values():
+        for shape in shapes:
+            kind = shape["type"]
+            required = {"rect": {"box"}, "ellipse": {"box"}, "path": {"d"},
+                        "text": {"box", "text", "size"}, "image": {"box", "asset"}}[kind]
+            allowed = {"type"} | required
+            if kind != "image":
+                allowed |= {"fill", "stroke", "strokeWidth"}
+            if kind == "rect":
+                allowed.add("radius")
+            if required - shape.keys() or shape.keys() - allowed:
+                raise ValueError(f"{sid}: invalid fields for artwork shape {kind}; requires {', '.join(sorted(required))}.")
+            if kind == "path":
+                if not _path_valid(shape["d"]):
+                    raise ValueError(f"{sid}: invalid artwork SVG path coordinates.")
+                continue
+            x, y, w, h = shape["box"]
+            if (x + w > 944 or y + h > 760 or
+                    (kind == "text" and (w or h or y + shape["size"] > 760)) or
+                    (kind != "text" and (w <= 0 or h <= 0))):
+                raise ValueError(f"{sid}: artwork {kind} is outside the 944 × 760 illustration canvas or has an invalid size.")
+            if kind == "image" and (shape["asset"] not in scene.get("assets", []) or
+                                    not re.search(r"\.(png|jpe?g|webp)$", shape["asset"], re.I)):
+                raise ValueError(f"{sid}: artwork images need a local PNG, JPG or WebP listed in scene assets.")
+    tokens = _tokenize(scene["narration"])
+    for ev in artwork.get("events", []):
+        action, target = ev["action"], ev["target"]
+        if action not in ARTWORK_ACTIONS or target not in layers:
+            raise ValueError(f"{sid}: unsupported artwork action or unknown target: {action} / {target}.")
+        if action == "transform" and (ev.get("value") not in layers or ev["value"] == target):
+            raise ValueError(f"{sid}: transform needs a different destination layer ID in value.")
+        if action == "connect" and not any(s["type"] == "path" and s.get("stroke", "none") != "none"
+                                           for s in layers[target]):
+            raise ValueError(f"{sid}: connect needs a stroked path on layer {target}.")
+        if action == "type" and any(s["type"] != "text" for s in layers[target]):
+            raise ValueError(f"{sid}: type needs a text-only layer.")
+        if ev.get("anchor"):
+            phrase = _tokenize(ev["anchor"])
+            if not phrase or len(_phrase_starts(tokens, phrase)) < ev.get("occurrence", 1):
+                raise ValueError(f"{sid}: artwork anchor {ev['anchor']!r} is missing from the narration.")
+        elif "at" not in ev or ev["at"] >= scene["end"] - scene["start"]:
+            raise ValueError(f"{sid}: artwork event {action} needs a spoken anchor or an in-scene time.")
 
 
 def resolve_anchor_time(
@@ -39,12 +127,29 @@ def resolve_anchor_time(
     *,
     fallback_ratio: float = 0.35,
     after_rel: float = 0.0,
-) -> float:
+    exact: bool = False,
+    occurrence: int = 1,
+) -> float | None:
     """Resolve narration word/phrase anchor into scene-relative seconds [0.05, scene_dur - 0.20]."""
     cands = [anchors] if isinstance(anchors, str) else list(anchors or [])
     dur = max(0.6, float(scene_dur))
     ceiling = max(0.18, dur - 0.22)
     phrase_tokens_list = [_tokenize(c) for c in cands if c and _tokenize(c)]
+
+    if exact:
+        # Reviewed timing can group multiple script tokens into one measured interval.
+        timed = [(_token, float(word["start"]) - scene_start)
+                 for word in scene_words for _token in _tokenize(word["text"])]
+        tokens = [token for token, _ in timed] if timed else _tokenize(narration)
+        for phrase in phrase_tokens_list:
+            matches = _phrase_starts(tokens, phrase)
+            if timed and len(matches) != len(_phrase_starts(_tokenize(narration), phrase)):
+                continue
+            if len(matches) >= occurrence:
+                idx = matches[occurrence - 1]
+                at = timed[idx][1] if timed else idx / len(tokens) * scene_dur
+                return round(max(0.0, min(scene_dur, at)), 3)
+        return None
 
     if scene_words and phrase_tokens_list:
         w_norms = [_norm(w.get("text", "")) for w in scene_words]
@@ -94,6 +199,23 @@ def compile_scene_storyboard(
     desc = scene.get("visual", {}).get("description") or ""
     heading = scene.get("heading") or scene.get("id", "scene")
     anim = scene.get("animation") or []
+
+    if component == "semantic-artwork":
+        artwork = explicit["artwork"]
+        resolved = []
+        for event in artwork.get("events", []):
+            if event.get("anchor"):
+                at = resolve_anchor_time(event["anchor"], scene_words, narr, scene_start, scene_dur,
+                                         exact=True, occurrence=event.get("occurrence", 1))
+                if at is None:
+                    raise ValueError(f"{scene['id']}: artwork phrase {event['anchor']!r} has no aligned onset.")
+            else:
+                at = min(event["at"], scene_dur)
+            duration = min(float(event.get("duration", 0.36)), scene_dur - at)
+            if duration <= 0:
+                raise ValueError(f"{scene['id']}: artwork event {event['action']} falls outside the measured scene.")
+            resolved.append({**event, "at": at, "duration": duration})
+        return {**explicit, "events": sorted(resolved, key=lambda ev: ev["at"])}
 
     def anchor(cands, ratio, min_after=0.0):
         return resolve_anchor_time(cands, scene_words, narr, scene_start, scene_dur, fallback_ratio=ratio, after_rel=min_after)
