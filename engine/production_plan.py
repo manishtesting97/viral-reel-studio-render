@@ -159,10 +159,52 @@ def production_prompt(project, config, badge=None):
     existing_plan = project / "plan.json"
     sponsor_context = prompt_context(project, load(existing_plan) if existing_plan.is_file() else None)
     prefs = preferences(director_state(project).get("preferences", {}))
-    return ("Create an original vertical Instagram Reel production plan. Return only one JSON object "
-          "conforming to the schema below. Copy the brief values exactly. Use contiguous estimated "
-          "scene times from 0 through duration, and scene-relative animation/audio cue times. "
+    brief_id = str(config.get("id") or "reel-plan").strip() or "reel-plan"
+    creator_name = str(brand.get("ownerName") or brand.get("brandName") or brand.get("id") or "Creator").strip()
+    handle_raw = str(brand.get("instagramUsername") or brand.get("handle") or "").strip().lstrip("@")
+    if not handle_raw and str(brand.get("id") or config.get("brand") or "").strip() == "manishjangra97":
+        handle_raw = "manishjangra97"
+    handle = f"@{handle_raw}" if handle_raw else ""
+    raw_cta = brand.get("cta")
+    brand_cta = str(raw_cta).strip() if isinstance(raw_cta, str) else ""
+    cta_enabled = raw_cta is not False and brand_cta.casefold() not in {"none", "off", "disabled"} and bool(brand_cta or handle)
+    profile_picture = str(brand.get("profilePicture") or "").strip()
+    if cta_enabled:
+        identity_bits = [part for part in (creator_name, handle, f'brand CTA "{brand_cta}"' if brand_cta else "") if part]
+        asset_note = (f'include "{profile_picture}" in assets and ' if profile_picture else "")
+        cta_guidance = (
+            f"Instagram Follow CTA ({', '.join(identity_bits)}): end the reel with one short, natural, topic-relevant "
+            f"spoken follow CTA scene (~3 to 5 seconds) inside total brief.duration (set outro to 0 so no duplicate "
+            "spoken or visual outro is added). Adapt the CTA naturally to brief.topic and brief.language instead of "
+            "using identical boilerplate; only use this brand profile's creator name, handle "
+            + (f"({handle}) " if handle else "")
+            + "and CTA setting—never insert another creator's name or handle. Example style only: "
+            f'"Aisi interesting jaankari ke liye Instagram par {creator_name} ko follow karo." '
+            f"For this closing CTA scene (id \"creator-cta\", without storyboard.artwork so the engine reuses the "
+            f"existing creator_cta_outro and profile photo), {asset_note}keep all spoken CTA words in scene.narration, "
+            "captions and storyboard.events word anchors (for example revealing creator-profile and triggering follow-cta "
+            "on the spoken follow phrase) so visual animation stays synchronized with narration. "
+        )
+    else:
+        cta_guidance = (
+            "Respect the selected brand profile CTA setting (disabled): omit any follow CTA scene, set outro to 0, "
+            "and never insert another brand's handle. "
+        )
+    return ("Create an original vertical Instagram Reel production plan conforming to the schema below. "
+          "Copy the brief values exactly. Use contiguous estimated scene times from 0 through duration, "
+          "and scene-relative animation/audio cue times. "
           "Respect brief.language strictly: do not force Hinglish into Hindi or English projects. "
+          "Scroll-stopping hook (first 1 to 3 seconds): open immediately on a strong, topic-specific curiosity gap, "
+          "surprising fact, relatable problem, meaningful question or unexpected comparison tailored to brief.topic, "
+          "niche, audience, language and duration. Give viewers a genuine reason to stop scrolling and deliver the "
+          "answer or payoff promised by the hook. Never use generic openers such as \"Hello guys\", "
+          "\"Aaj hum baat karenge\" or empty greetings, and avoid clickbait, fake statistics or exaggerated claims. "
+          "Write a short, readable, impactful on-screen hook heading, make frame 0 visually engaging, and match "
+          "the opening visual and animation directly to the spoken hook. Vary hook formulas across reels rather than repeating one template. "
+          "Audience retention: maintain crisp, natural storytelling from hook to satisfying payoff; cut filler, "
+          "repetition and long-winded exposition; use relevant visual changes at meaningful narration beats with "
+          "curiosity, contrast, demonstration and clear explanation while preserving factual accuracy. "
+          f"{cta_guidance}"
           "Write natural, engaging, conversational narration that preserves strong hooks, storytelling, "
           "audience retention, essential technical terminology and factual accuracy without sacrificing content quality "
           "or inventing claims, statistics or recognition guarantees. "
@@ -194,7 +236,7 @@ def production_prompt(project, config, badge=None):
           "match the final spoken wording. "
           "Specify original scene-specific visuals; use the style profile as art direction and "
           "the brand profile as identity. Asset entries are local relative filenames, never URLs. "
-          "For every explanatory scene supply `storyboard.artwork` with named layers of shapes that actually depict "
+          "For every explanatory scene (before the closing CTA scene) supply `storyboard.artwork` with named layers of shapes that actually depict "
           "the objects, interfaces and relationships spoken about. Draw on a 944 by 760 canvas inside the safe zone. "
           "Shapes are rect, ellipse, path, text and image. Use box [x,y,width,height] for rect, ellipse and image. "
           "For text use box [x,y,0,0] (top-left), text and size. For paths supply SVG path data d. "
@@ -211,7 +253,10 @@ def production_prompt(project, config, badge=None):
           "to the specific requirement instead of artwork. This stops automatic substitution and permits supplied media "
           "or a reviewed custom scene. "
           "For a visual-only revision of a recorded plan, change artwork only to retain approved timing. "
-          "Do not fabricate product screenshots, medical claims, metrics or unsupported facts.\n\n"
+          "Do not fabricate product screenshots, medical claims, metrics or unsupported facts. "
+          f"Output format & downloadable JSON file: return one valid JSON object matching the schema below with zero "
+          f"extra commentary inside the JSON, AND also generate and provide that exact JSON as a downloadable `.json` file "
+          f"(`{brief_id}.json`) when file download output is supported in your environment.\n\n"
           + json.dumps({"brief": config, "brand": brand, "referenceStyle": style,
                         **({"badge": badge} if badge else {}),
                         **({"sponsorship": sponsor_context} if sponsor_context else {}),
