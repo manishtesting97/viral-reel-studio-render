@@ -485,7 +485,7 @@ def _apex_recovery(decoded, duration, language, recovery_spec, models_dir):
         str(apex_dir), device="cpu", compute_type="int8", cpu_threads=4, local_files_only=True,
     )
     whisper_lang = "en" if language == "hinglish" else {"en": "en", "hi": "hi"}.get(language) or "en"
-    raw_segments, _ = apex_model.transcribe_original(
+    raw_segments, info = apex_model.transcribe_original(
         str(decoded), language=whisper_lang, beam_size=3, word_timestamps=True, condition_on_previous_text=False,
     )
     apex_rows = []
@@ -496,31 +496,41 @@ def _apex_recovery(decoded, duration, language, recovery_spec, models_dir):
 
     forced_words = []
     scenes = recovery_spec.get("scenes") or []
-    narration = "\n".join(str(s.get("narration", "")).strip() for s in scenes if str(s.get("narration", "")).strip())
+    narration = " ".join(str(s.get("narration", "")).strip() for s in scenes if str(s.get("narration", "")).strip())
     if narration:
         aligned = apex_model.align(
-            str(decoded), narration, language=whisper_lang, original_split=True,
+            str(decoded), narration, language=whisper_lang, original_split=False,
             fast_mode=True, suppress_silence=False, remove_instant_words=True, verbose=None,
         )
         forced_words = _valid_word_tokens(aligned.all_words(), duration)
 
-    # Combine forced-aligned tokens with non-overlapping native Apex ASR tokens so both missing gaps and ASR evidence are kept.
-    merged = list(forced_words)
+    # Start with continuous forced-aligned tokens, then fill uncovered spans from native Apex ASR (trimming small overlaps).
+    clean_words = list(forced_words)
     for aw in apex_words:
-        if not any(min(aw["end"], ew["end"]) > max(aw["start"], ew["start"]) + 0.02 for ew in merged):
-            merged.append(aw)
-    merged.sort(key=lambda w: w["start"])
-    clean_words = []
-    for tok in merged:
-        ts, te = tok["start"], tok["end"]
-        if clean_words and ts < clean_words[-1]["end"]:
-            ts = round(clean_words[-1]["end"], 3)
-        if te - ts >= 0.03:
-            clean_words.append({**tok, "start": ts, "end": te})
+        ts, te = aw["start"], aw["end"]
+        for ew in clean_words:
+            if te <= ew["start"] + 1e-4 or ts >= ew["end"] - 1e-4:
+                continue
+            if ts < ew["start"] <= te and (ew["start"] - ts) >= 0.04:
+                te = min(te, ew["start"])
+            elif ts <= ew["end"] < te and (te - ew["end"]) >= 0.04:
+                ts = max(ts, ew["end"])
+            else:
+                te = ts
+                break
+        if te - ts >= 0.04:
+            clean_words.append({**aw, "start": round(ts, 3), "end": round(te, 3)})
+    clean_words.sort(key=lambda w: w["start"])
 
+    recognition = {
+        "configuredLanguage": whisper_lang,
+        "language": getattr(info, "language", whisper_lang) or whisper_lang,
+        "languageProbability": float(getattr(info, "language_probability", 1.0) or 1.0),
+    }
     del apex_model
     return {
         "model": "apex-ct2-int8",
+        "recognition": recognition,
         "windows": recovery_spec.get("windows") or [[0.0, round(duration, 2), True]],
         "words": clean_words,
         "alternate": apex_words,
@@ -549,55 +559,65 @@ def runner_transcribe(job):
     )
     duration = probe_duration(decoded)
     language = manifest["language"]
-    model_name = whisper_model_name(language, MODELS)
-    whisper_lang = None if language == "hinglish" else {"en": "en", "hi": "hi"}.get(language)
     started = time.monotonic()
-    model = load_whisper_model(model_name, MODELS)
-    words, recognition = run_whisper(model, decoded, whisper_lang, beam_size=3, condition_on_previous_text=False)
-    words = [w for w in words if w["end"] <= duration + 0.02]
-    payload = {
-        "language": recognition["language"],
-        "model": model_name,
-        "revision": manifest["revision"],
-        "recognition": recognition,
-        "words": words,
-    }
-    rec_windows = manifest.get("windows")
-    if isinstance(rec_windows, list) and rec_windows:
-        from faster_whisper.audio import decode_audio
-        sample_rate = 16000
-        audio = decode_audio(str(decoded), sampling_rate=sample_rate)
-        rec_prim, rec_alt = [], []
-        for item in rec_windows[:10]:
-            start, end, has_en = float(item[0]), float(item[1]), bool(item[2]) if len(item) > 2 else False
-            left, right = max(0, round(start * sample_rate)), min(len(audio), round(end * sample_rate))
-            if right <= left:
-                continue
-            rw, _ = run_whisper(model, audio[left:right], whisper_lang, offset=left / sample_rate,
-                                beam_size=3, condition_on_previous_text=False)
-            rec_prim.extend(w for w in rw if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
-            if has_en and language == "hinglish" and (end - start) <= 6.0:
-                rwe, _ = run_whisper(model, audio[left:right], "en", offset=left / sample_rate,
-                                     beam_size=3, condition_on_previous_text=False)
-                rec_alt.extend(w for w in rwe if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
-        payload["recovery"] = {"windows": rec_windows[:10], "words": rec_prim, "alternate": rec_alt, "model": model_name}
-    if (language == "hinglish" and model_name != "tiny.en" and duration <= 180
-            and any(DEVANAGARI.search(w["text"]) for w in words)
-            and (MODELS / "models--Systran--faster-whisper-tiny.en/refs/main").is_file()):
-        del model
-        witness = load_whisper_model("tiny.en", MODELS)
-        alt_words, alt_info = run_whisper(witness, decoded, "en", beam_size=3, condition_on_previous_text=False)
-        alt_info["witnessModel"] = "tiny.en"
-        payload["alternate"] = [w for w in alt_words if w["end"] <= duration + 0.02]
-        payload["alternateRecognition"] = alt_info
-        del witness
-    else:
-        del model
     recovery_file = folder / "recovery.json"
-    if recovery_file.is_file():
-        apex_payload = _apex_recovery(decoded, duration, language, read(recovery_file), MODELS)
-        if apex_payload is not None:
-            payload["recovery"] = apex_payload
+    apex_payload = (_apex_recovery(decoded, duration, language, read(recovery_file), MODELS)
+                    if recovery_file.is_file() else None)
+    if apex_payload is not None:
+        model_name = "apex-ct2-int8"
+        words = apex_payload["apexWords"]
+        payload = {
+            "language": apex_payload["recognition"]["language"],
+            "model": model_name,
+            "revision": manifest["revision"],
+            "recognition": apex_payload["recognition"],
+            "words": words,
+            "recovery": {k: v for k, v in apex_payload.items() if k != "recognition"},
+        }
+    else:
+        model_name = whisper_model_name(language, MODELS)
+        whisper_lang = None if language == "hinglish" else {"en": "en", "hi": "hi"}.get(language)
+        model = load_whisper_model(model_name, MODELS)
+        words, recognition = run_whisper(model, decoded, whisper_lang, beam_size=3, condition_on_previous_text=False)
+        words = [w for w in words if w["end"] <= duration + 0.02]
+        payload = {
+            "language": recognition["language"],
+            "model": model_name,
+            "revision": manifest["revision"],
+            "recognition": recognition,
+            "words": words,
+        }
+        rec_windows = manifest.get("windows")
+        if isinstance(rec_windows, list) and rec_windows:
+            from faster_whisper.audio import decode_audio
+            sample_rate = 16000
+            audio = decode_audio(str(decoded), sampling_rate=sample_rate)
+            rec_prim, rec_alt = [], []
+            for item in rec_windows[:10]:
+                start, end, has_en = float(item[0]), float(item[1]), bool(item[2]) if len(item) > 2 else False
+                left, right = max(0, round(start * sample_rate)), min(len(audio), round(end * sample_rate))
+                if right <= left:
+                    continue
+                rw, _ = run_whisper(model, audio[left:right], whisper_lang, offset=left / sample_rate,
+                                    beam_size=3, condition_on_previous_text=False)
+                rec_prim.extend(w for w in rw if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
+                if has_en and language == "hinglish" and (end - start) <= 6.0:
+                    rwe, _ = run_whisper(model, audio[left:right], "en", offset=left / sample_rate,
+                                         beam_size=3, condition_on_previous_text=False)
+                    rec_alt.extend(w for w in rwe if left / sample_rate <= w["start"] < w["end"] <= right / sample_rate)
+            payload["recovery"] = {"windows": rec_windows[:10], "words": rec_prim, "alternate": rec_alt, "model": model_name}
+        if (language == "hinglish" and model_name != "tiny.en" and duration <= 180
+                and any(DEVANAGARI.search(w["text"]) for w in words)
+                and (MODELS / "models--Systran--faster-whisper-tiny.en/refs/main").is_file()):
+            del model
+            witness = load_whisper_model("tiny.en", MODELS)
+            alt_words, alt_info = run_whisper(witness, decoded, "en", beam_size=3, condition_on_previous_text=False)
+            alt_info["witnessModel"] = "tiny.en"
+            payload["alternate"] = [w for w in alt_words if w["end"] <= duration + 0.02]
+            payload["alternateRecognition"] = alt_info
+            del witness
+        else:
+            del model
     elapsed = round(time.monotonic() - started, 3)
     delivery = job / "delivery"
     delivery.mkdir()
