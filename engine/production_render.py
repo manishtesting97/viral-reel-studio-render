@@ -195,8 +195,6 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
         shutil.copyfile(path, dest)
         brand_urls[name] = dest.relative_to(target).as_posix()
     badge_cfg = plan.get("badge") or {"mode": "normal", "title": plan["topic"]}
-    if partners:
-        badge_cfg = {**badge_cfg, "mode": "normal"}
     save(target / "timing.json", timing["scenes"])
     write(target / "assets/timing.js",
           "window.reelScenes = " + (target / "timing.json").read_text(encoding="utf-8") + ";\n"
@@ -211,27 +209,31 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
     layers = []
     asset_layers = []
     asset_motion = []
+    caption_size, caption_margin = caption_geometry(brand, style)
     for index, actual in enumerate(timing["scenes"]):
         sid = actual["id"]
         end = render_duration if index + 1 == len(timing["scenes"]) else actual["end"]
         original = scenes[sid].read_text(encoding="utf-8") if sid in scenes else ""
         selection = assignments.get(sid)
+        sponsored = any(sponsorship.scene_scope(sponsor, sid, last=index + 1 == len(timing["scenes"])))
+        extra_attrs = ""
+        if sponsored:
+            clearance = max(caption_margin, sponsorship.CAPTION_MARGIN) + 2 * caption_size + 30
+            extra_attrs = f' style="--vrs-caption-clearance:{clearance}px"'
         if selection and selection["layers"]:
             addition, effects = asset_render.markup(target, actual, selection, assigned, width, fps, 20+15*index)
             asset_motion.append(effects)
             asset_layers.append(addition)
-            branded_scene = partners and (sponsor["mode"] == "full" or sid in sponsor["scenes"]
-                                          or (index+1 == len(timing["scenes"]) and sponsor["endCTA"]))
             if sid in scenes:
                 original = f'<div class="vrs-original">{original}</div>'
             else:
                 heading = escape(plan["scenes"][index]["heading"])
-                badge = "" if branded_scene else '<div class="vrs-meta-badge vrs-media-badge"></div>'
+                badge = '<div class="vrs-meta-badge vrs-media-badge"></div>'
                 original = (f'{badge}<div class="vrs-auto-layout vrs-media-heading">'
                             f'<h2 class="vrs-auto-heading">{heading}</h2></div>')
         layers.append(
-            f'<section id="{sid}" class="clip scene" data-start="{actual["start"]:.9f}" '
-            f'data-duration="{end - actual["start"]:.9f}" data-track-index="0">'
+            f'<section id="{sid}" class="clip scene{" vrs-sponsored-scene" if sponsored else ""}" data-start="{actual["start"]:.9f}" '
+            f'data-duration="{end - actual["start"]:.9f}" data-track-index="0"{extra_attrs}>'
             + original + "</section>")
     scripts = ['<script src="assets/timing.js"></script>', '<script src="assets/gsap.min.js"></script>']
     for sid in scenes:
@@ -269,7 +271,6 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
         variables += f";--vrs-username-size:{username.get('size', 28)}px;--vrs-username-color:{username.get('color', '#181412')}"
         variables += f";--vrs-heading-align:{mobile.get('heading', {}).get('alignment', 'center')}"
         variables += f";--vrs-artwork-scale:{mobile.get('scale2d', 1)}"
-    caption_size, caption_margin = caption_geometry(brand, style)
     variables += f";--vrs-caption-clearance:{caption_size + caption_margin + 36}px"
     for setting, token in {"headerTop":"header-top", "headerLeft":"header-left",
                            "headerSize":"header-size", "stageTop":"stage-top",
@@ -286,9 +287,8 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
         ("headerVisible","#profile-header"), ("progressVisible",".k8s-progress-rail"),
         ("outroVisible","#profile-outro")) if visual.get(flag) is False).replace("{{","{").replace("}}","}")
     overlay, motion = profile_markup(brand, brand_urls.get("profile"), timing["scenes"][-1], render_duration, mobile=bool(mobile))
-    header_bottom = max(330, visual.get("headerTop", 283) + visual.get("headerSize", 64) + 29) if (
-        brand_urls.get("profile") and visual.get("headerVisible") is not False) else 330
-    disclosures = sponsorship.panels(target, sponsor, partners, timing, render_duration, header_bottom)
+    disclosures, sponsor_motion = sponsorship.panels(target, sponsor, partners, timing, render_duration)
+    asset_motion.append(sponsor_motion)
     write(target / "index.html", f"""<!doctype html>
 <html lang="{lang}"><meta charset="utf-8"><title>{escape(plan["topic"])}</title>
 <style>
@@ -539,11 +539,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     srt, ass = [], []
     sanitize = str.maketrans({"{": "(", "}": ")", "\\": "／"})
 
+    sponsor = sponsorship.saved(project) if project else {"mode": "normal", "scenes": {}}
+    # Captions and the active-word pill use the same scene margin.
+    scene_margin = margin_v
+
     def cue(from_sec, to_sec, text, layer=1, style_name="Default"):
         start = stamp(from_sec, 2, ".")
         end = stamp(to_sec, 2, ".")
         if start < end:
-            ass.append(f"Dialogue: {layer},{start},{end},{style_name},,0,0,0,,{text}")
+            ass.append(f"Dialogue: {layer},{start},{end},{style_name},,0,0,{scene_margin if scene_margin != margin_v and style_name != 'Pill' else 0},,{text}")
 
     def split_width(group):
         if not pil_font or len(group) <= 1:
@@ -561,7 +565,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             chunks.append(cur)
         return chunks
 
-    for scene in plan["scenes"]:
+    for index, scene in enumerate(plan["scenes"]):
+        sponsored = any(sponsorship.scene_scope(sponsor, scene["id"], last=index + 1 == len(plan["scenes"])))
+        scene_margin = max(margin_v, sponsorship.CAPTION_MARGIN) if sponsored else margin_v
         selected = [word for word in words if word["scene"] == scene["id"]]
         gap = style.get("captions", {}).get("maxPauseGapSec", 0.22)
         style_name = "DarkScene" if (not mobile and scene["id"] in dark_scenes and use_highlighter) else "Default"
@@ -576,7 +582,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 full_line = " ".join(labels)
                 full_w = (pil_font.getlength(full_line) * win_ratio) if pil_font else 0
                 pill_h = round(font_size * (0.9 if mobile else 0.78))
-                pill_y = round(1920 - margin_v - font_size * 0.59 - pill_h / 2)
+                pill_y = round(1920 - scene_margin - font_size * 0.59 - pill_h / 2)
                 for index, word in enumerate(group):
                     if use_highlighter and pil_font:
                         prefix = " ".join(labels[:index]) + (" " if index > 0 else "")
