@@ -215,8 +215,14 @@ def render_context(project, plan, *, verify=False, assignments=None):
     for profile in used.values():
         inventory.update(profile_assets(profile))
     if used:
-        for sid, selection in (assignments or {}).items():
-            registered = {layer["asset"] for layer in selection["layers"]} & inventory.keys()
+        for scene in plan["scenes"]:
+            sid = scene["id"]
+            selection = (assignments or {}).get(sid, {})
+            media_ids = {layer["asset"] for layer in selection.get("layers", [])}
+            if selection.get("mode") not in {"image", "video"}:
+                media_ids.update(part["asset"] for part in scene.get("storyboard", {}).get("model", {}).get("parts", [])
+                                 if part["shape"] == "glb")
+            registered = media_ids & inventory.keys()
             if not registered:
                 continue
             if config["mode"] != "full" and sid not in config["scenes"]:

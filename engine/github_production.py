@@ -997,6 +997,11 @@ def _needs_apex_recovery(project, plan, caption_review, *, timing=None):
     if (plan.get("language") not in {"hi", "hinglish"} or not voice.is_file()
             or not caption_review.get("scriptWords")):
         return False
+    if caption_review.get("skippedWords") and (
+            caption_review.get("anchorIssues") or (timing and caption_review.get("premiumCaptionReady"))):
+        # Explicit owner decisions are bound to this recording. Resolve any blocked
+        # scene cue in review, or continue directly with the accepted caption track.
+        return False
     # Trigger on any real readiness failure (never solely on raw overall script coverage when readiness passes).
     reliable = caption_review.get("verifiedCoverage", caption_review.get("reliableCoverage"))
     has_failure = (

@@ -1288,9 +1288,10 @@ def _procedural_script(sid, model, events, scale=None):
       return {element, position:new T.Vector3().fromArray(position)};
     });
     const projection = new T.Vector3();
-    world.add(new T.HemisphereLight(0xe5f2ff, 0x776656, 2));
+    const studio = model.parts.some(part => ["glb", "rounded-box"].includes(part.shape));
+    world.add(new T.HemisphereLight(0xe5f2ff, 0x776656, studio ? 1.05 : 2));
     for (const [position, color, intensity] of [
-      [[-4, 9, 6], 0xfff0d9, 3], [[4, 4, -6], 0xcceaff, 2.3], [[0, 2, 8], 0xdbe9ff, 0.7]
+      [[-4, 9, 6], 0xfff0d9, 3], [[4, 4, -6], 0xcceaff, studio ? 1.45 : 2.3], [[0, 2, 8], 0xdbe9ff, 0.7]
     ]) {
       const light = new T.DirectionalLight(color, intensity);
       light.position.fromArray(position);
@@ -1303,7 +1304,7 @@ def _procedural_script(sid, model, events, scale=None):
       }
       world.add(light);
     }
-    const ground = new T.Mesh(new T.PlaneGeometry(30, 30), new T.ShadowMaterial({opacity:0.18}));
+    const ground = new T.Mesh(new T.PlaneGeometry(30, 30), new T.ShadowMaterial({opacity:studio ? 0.27 : 0.18}));
     ground.rotation.x = -Math.PI / 2;
     ground.position.y = -1.75;
     ground.receiveShadow = true;
@@ -1354,13 +1355,51 @@ def _procedural_script(sid, model, events, scale=None):
     const parts = new Map();
     const assembly = new T.Group();
     world.add(assembly);
+    const baseURL = document.baseURI;
+    const loader = model.parts.some(part => part.shape === "glb")
+      ? (await import(new URL("assets/vendor/loaders/GLTFLoader.js", baseURL).href)).GLTFLoader : null;
+    const rounded = model.parts.some(part => part.shape === "rounded-box")
+      ? (await import(new URL("assets/vendor/geometries/RoundedBoxGeometry.js", baseURL).href)).RoundedBoxGeometry : null;
+    const geometryBounds = new Map();
+    const imported = new Map();
     for (const part of model.parts) {
       const [x,y,z] = part.size;
+      let mesh;
+      if (part.shape === "glb") {
+        if (!imported.has(part.asset)) {
+          const url = new URL("assets/models/" + part.asset + ".glb", baseURL).href;
+          const manager = new T.LoadingManager();
+          manager.setURLModifier(resource => {
+            if (resource === url || resource.startsWith("blob:")) return resource;
+            throw new Error("External resource in model " + part.asset);
+          });
+          imported.set(part.asset, (await new loader(manager).loadAsync(url)).scene);
+        }
+        mesh = new T.Group();
+        const content = imported.get(part.asset).clone(true);
+        const bounds = new T.Box3().setFromObject(content);
+        const size = bounds.getSize(new T.Vector3());
+        const center = bounds.getCenter(new T.Vector3());
+        if (bounds.isEmpty() || !Number.isFinite(size.lengthSq()) || !Number.isFinite(center.lengthSq())
+            || size.lengthSq() === 0) throw new Error("GLB has no finite visible bounds: " + part.asset);
+        const fit = Math.min(...part.size.map((limit,i) => limit / Math.max(1e-6, size.getComponent(i))));
+        const centered = new T.Group();
+        content.position.sub(center);
+        centered.add(content);
+        centered.scale.setScalar(fit);
+        mesh.add(centered);
+        mesh.traverse(node => {
+          if (node.isMesh) { node.castShadow = true; node.receiveShadow = true; }
+        });
+        geometryBounds.set(mesh, new T.Box3().setFromObject(mesh));
+      } else {
       let geometry;
       if (part.shape === "loft") geometry = loft(part.sections);
       else if (part.shape === "tube") {
         const curve = new T.CatmullRomCurve3(part.points.map(point => new T.Vector3().fromArray(point)));
         geometry = new T.TubeGeometry(curve,48,x/2,8,false);
+      } else if (part.shape === "rounded-box") {
+        geometry = new rounded(x, y, z, 2, Math.min(x,y,z) * 0.14);
       } else if (part.shape === "box") geometry = new T.BoxGeometry(x,y,z);
       else if (part.shape === "sphere") {
         geometry = new T.SphereGeometry(0.5,32,18);
@@ -1379,11 +1418,13 @@ def _procedural_script(sid, model, events, scale=None):
         roughnessMap:finish(part.texture),
         transparent:opacity<1, opacity, depthWrite:opacity===1
       });
-      const mesh = new T.Mesh(geometry,material);
+      mesh = new T.Mesh(geometry,material);
       mesh.castShadow = opacity===1;
       mesh.receiveShadow = true;
+      geometry.computeBoundingBox();
+      geometryBounds.set(mesh,geometry.boundingBox);
+      }
       (part.fixed ? world : assembly).add(mesh);
-      if (model.framingScale !== null) geometry.computeBoundingBox();
       parts.set(part.id,mesh);
       const visibilityCue = model.events.find(event=>
         event.target===part.id && (event.action==="reveal" || event.action==="hide"));
@@ -1449,7 +1490,7 @@ def _procedural_script(sid, model, events, scale=None):
         world.updateMatrixWorld(true);
         let edge = 0;
         for (const mesh of parts.values()) {
-          const {min, max} = mesh.geometry.boundingBox;
+          const {min, max} = geometryBounds.get(mesh);
           for (const x of [min.x,max.x]) for (const y of [min.y,max.y]) for (const z of [min.z,max.z]) {
             projection.set(x,y,z).applyMatrix4(mesh.matrixWorld).project(camera);
             edge = Math.max(edge, Math.abs(projection.x), Math.abs(projection.y));
@@ -1457,6 +1498,10 @@ def _procedural_script(sid, model, events, scale=None):
         }
         camera.zoom = Math.max(.65, Math.min(model.framingScale, .88 / Math.max(edge, .01)));
         camera.updateProjectionMatrix();
+      }
+      if (studio && model.groundShadows !== false) {
+        const bounds = new T.Box3().setFromObject(assembly);
+        if (!bounds.isEmpty()) ground.position.y = bounds.min.y - 0.02;
       }
       renderer.render(world,camera);
       const scale = Math.min(mount.clientWidth / width, mount.clientHeight / height);
@@ -2975,6 +3020,18 @@ def generate_visuals(
     assets_dir.mkdir(parents=True, exist_ok=True)
 
     # Write shared stylesheet and stage safe project-declared local assets (engine injects gsap/three vendors)
+    for item in entries:
+        if item["component"] != "procedural-model":
+            continue
+        for part in item["scene"]["storyboard"]["model"]["parts"]:
+            if part["shape"] == "glb":
+                source = asset_library.model_source(project, plan, part["asset"])
+                target = assets_dir / "models" / f'{part["asset"]}.glb'
+                if not target.resolve().is_relative_to(assets_dir.resolve()) or target.is_symlink():
+                    raise ValueError("Unsafe staged model path.")
+                target.parent.mkdir(exist_ok=True)
+                if not target.is_file() or asset_library.hash_file(target) != asset_library.hash_file(source):
+                    shutil.copyfile(source, target)
     font_css = _stage_declared_scene_assets(plan, brand, assets_dir, creator_photo)
     body_css = COMMON_CSS if font_css else COMMON_CSS.replace('"Noto Serif", ', '')
     write(assets_dir / "vrs-auto.css", font_css + body_css)

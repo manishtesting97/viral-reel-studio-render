@@ -69,6 +69,17 @@ def source_files(source, plan, assignments=None):
         for asset in scene["assets"]:
             if assets / asset not in files:
                 raise ValueError(f"Missing required reviewed asset: {asset}")
+    for scene in plan["scenes"]:
+        if scene["id"] not in scenes:
+            continue
+        for part in scene.get("storyboard", {}).get("model", {}).get("parts", []):
+            if part["shape"] == "glb":
+                model = assets / "models" / f'{part["asset"]}.glb'
+                if model not in files:
+                    raise ValueError(f'Missing staged GLB model for {scene["id"]}: {part["asset"]}')
+                asset_library.inspect_glb(model)
+    if any(path.is_relative_to(assets / "vendor") for path in files):
+        raise ValueError("assets/vendor is reserved for installed renderer modules.")
     if any(path.is_relative_to(assets / "assigned-media") for path in files):
         raise ValueError("assets/assigned-media is reserved for the asset library.")
     if any(path.name in {"gsap.min.js", "three.module.min.js", "timing.js"}
@@ -164,6 +175,19 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
     (target / "assets").mkdir(exist_ok=True)
     for path in (GSAP_VENDOR, THREE_VENDOR):
         shutil.copyfile(path, target / "assets" / path.name)
+    shapes = {part["shape"] for scene in plan["scenes"] if scene["id"] in scenes
+              for part in scene.get("storyboard", {}).get("model", {}).get("parts", [])}
+    modules = []
+    if "glb" in shapes:
+        modules.extend(("loaders/GLTFLoader.js", "utils/BufferGeometryUtils.js"))
+    if "rounded-box" in shapes:
+        modules.append("geometries/RoundedBoxGeometry.js")
+    for name in modules:
+        path = THREE_VENDOR.parent.parent / "examples" / "jsm" / name
+        destination = target / "assets" / "vendor" / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        write(destination, path.read_text(encoding="utf-8").replace(
+            "from 'three';", "from '../../three.module.min.js';"))
     brand_urls = {}
     for name, path in brand_files.items():
         dest = target / "assets" / "brand-profile" / f"{name}{path.suffix.lower()}"
@@ -200,8 +224,11 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
                                           or (index+1 == len(timing["scenes"]) and sponsor["endCTA"]))
             if sid in scenes:
                 original = f'<div class="vrs-original">{original}</div>'
-            elif not branded_scene:
-                original = '<div class="vrs-meta-badge vrs-media-badge"></div>'
+            else:
+                heading = escape(plan["scenes"][index]["heading"])
+                badge = "" if branded_scene else '<div class="vrs-meta-badge vrs-media-badge"></div>'
+                original = (f'{badge}<div class="vrs-auto-layout vrs-media-heading">'
+                            f'<h2 class="vrs-auto-heading">{heading}</h2></div>')
         layers.append(
             f'<section id="{sid}" class="clip scene" data-start="{actual["start"]:.9f}" '
             f'data-duration="{end - actual["start"]:.9f}" data-track-index="0">'
@@ -299,7 +326,16 @@ body {{margin:0}}
 {hidden}
 {asset_render.CSS if assigned else ""}
 {sponsorship.CSS if partners else ""}
-{"#profile-header,#profile-outro{z-index:31}.vrs-media-badge{position:absolute;top:390px;left:89px;z-index:30;background:#fffef9;padding:10px 22px;border-radius:28px;font-size:26px}.vrs-media-badge .vrs-badge-tag{background:#ffd400;margin-right:12px;padding:2px 8px;border-radius:8px}" if assigned else ""}
+#profile-header,#profile-outro {{z-index:31}}
+#stage .vrs-media-badge {{position:absolute;top:var(--vrs-header-top,283px);right:68px;left:auto;
+  z-index:30;display:flex;align-items:center;gap:10px;background:#fffef9;padding:10px 22px;
+  border-radius:28px;font-size:22px}}
+.vrs-media-badge .vrs-badge-tag {{background:#ffd400;padding:2px 8px;border-radius:8px}}
+#stage .vrs-media-heading {{position:absolute;top:calc(var(--vrs-profile-bottom, 348px) + 42px);
+  left:90px;right:90px;bottom:auto;z-index:29;pointer-events:none}}
+.vrs-media-heading h2 {{margin:0;color:var(--vrs-heading-color,var(--brand-ink,#181412));
+  font-family:var(--vrs-heading-font,var(--brand-font,sans-serif));font-weight:700;
+  font-size:var(--vrs-heading-size,66px);text-align:var(--vrs-heading-align,center)}}
 </style>
 <main id="production" data-composition-id="production" data-start="0"
  data-duration="{render_duration:.9f}" data-width="{width}" data-height="{height}">

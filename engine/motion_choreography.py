@@ -69,12 +69,16 @@ def validate_model(scene):
     validate(model, schema["$defs"]["visualModel"], f"{sid}.storyboard.model", schema=schema)
     if storyboard.get("limitation"):
         raise ValueError(f"{sid}: a procedural model and an unsupported requirement cannot both be selected.")
+    if sum(part["shape"] == "glb" for part in model["parts"]) > 4:
+        raise ValueError(f"{sid}: use at most four imported models in one scene.")
     ids = {part["id"] for part in model["parts"]}
     if ids & {"camera", "assembly"} or len(ids) != len(model["parts"]):
         raise ValueError(f"{sid}: model part IDs must be unique and cannot use camera or assembly.")
     if sum((a-b)**2 for a,b in zip(model["eye"], model["look"])) < 1:
         raise ValueError(f"{sid}: the camera must be at least one unit from its subject.")
     for part in model["parts"]:
+        if (part["shape"] == "glb") != ("asset" in part):
+            raise ValueError(f"{sid}: GLB model parts require a library asset ID.")
         if part["shape"] == "loft":
             rings = part.get("sections", [])
             if (len(rings) < 2 or any(min(ring[3:]) < .005 for ring in rings)
@@ -209,8 +213,17 @@ def resolve_anchor_time(
         timed = [(_token, float(word["start"]) - scene_start)
                  for word in scene_words for _token in _tokenize(word["text"])]
         tokens = [token for token, _ in timed] if timed else _tokenize(narration)
+        if timed and all(type(word.get("scriptIndex")) is int for word in scene_words):
+            # Bind to the original script positions so a skipped word cannot join two
+            # formerly separate words into an apparent measured phrase.
+            timed_indices = [word["scriptIndex"] + offset for word in scene_words
+                             for offset in range(len(_tokenize(word["text"])))]
+        else:
+            timed_indices = None
         for phrase in phrase_tokens_list:
             matches = _phrase_starts(tokens, phrase)
+            if timed_indices is not None:
+                matches = [i for i in matches if timed_indices[i + len(phrase) - 1] - timed_indices[i] == len(phrase) - 1]
             if timed and len(matches) != len(_phrase_starts(_tokenize(narration), phrase)):
                 continue
             if len(matches) >= occurrence:
