@@ -154,6 +154,9 @@ COMMON_CSS = """/* Auto-generated universal editorial scene stylesheet inheritin
 }
 .vrs-procedural-model {position:relative; width:100%; min-height:0; flex:1}
 .vrs-procedural-model canvas {position:absolute; inset:0; width:100%; height:100%; object-fit:contain}
+.vrs-model-label {position:absolute; transform:translate(-50%,-50%); pointer-events:none;
+  color:#f8fafc; background:#18253a; border:1px solid #42516a; border-radius:8px;
+  padding:4px 12px; font-size:23px; font-weight:700; white-space:nowrap}
 .vrs-auto-heading {
   flex: none;
   margin: 0;
@@ -896,7 +899,7 @@ def _artwork_markup(storyboard):
     layers = []
     initially_hidden = {}
     for event in storyboard["events"]:
-        initially_hidden.setdefault(event["target"], event["action"] in {"reveal", "type", "connect"})
+        initially_hidden.setdefault(event["target"], event["action"] in {"reveal", "type", "connect", "sequence"})
         if event["action"] == "transform":
             initially_hidden.setdefault(event["value"], True)
     paints = {"ink": "var(--brand-ink, #181412)", "accent": "var(--brand-accent, #ea580c)",
@@ -935,6 +938,8 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
     sid_js = json.dumps(sid)
     beats_js = json.dumps([{"id": b["id"], "start": float(b["start"]), "end": float(b["end"])} for b in beats])
     events_js = json.dumps(storyboard.get("events", []) if storyboard else [])
+    directions = storyboard or {}
+    entrance_js = json.dumps(directions.get("artwork", directions.get("model", {})).get("entrance", "slide"))
     return f"""window.reelTimeline = window.reelTimeline || gsap.timeline({{paused:true}});
 {{
   const scene = (window.reelScenes || []).find(s => s.id === {sid_js}) || {{start: 0, end: 5, animation: []}};
@@ -964,8 +969,9 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
     if (prog) tl.fromTo(prog, {{scaleX:0}}, {{scaleX:1, duration:totalDur, ease:"none"}}, 0);
     const head = root.querySelector(".vrs-auto-heading");
     const stage = root.querySelector(".vrs-auto-stage, .vrs-cta-card");
-    if (head) tl.fromTo(head, {{opacity:0, y:16}}, {{opacity:1, y:0, duration:0.34, ease:"power3.out", immediateRender:false}}, scene.start);
-    if (stage) tl.fromTo(stage, {{opacity:0, y:18}}, {{opacity:1, y:0, duration:0.36, ease:"expo.out", immediateRender:false}}, scene.start + 0.03);
+    const entrance = {entrance_js};
+    if (head && entrance !== "cut") tl.fromTo(head, {{opacity:0, y:entrance === "slide" ? 16 : 0}}, {{opacity:1, y:0, duration:0.34, ease:"power3.out", immediateRender:false}}, scene.start);
+    if (stage && entrance !== "cut") tl.fromTo(stage, {{opacity:0, y:entrance === "slide" ? 18 : 0}}, {{opacity:1, y:0, duration:0.36, ease:"expo.out", immediateRender:false}}, scene.start + 0.03);
     root.querySelectorAll(".js-beat").forEach((el, idx) => {{
       if (el.hasAttribute("data-ev")) return;
       const beat = bAt(Math.min(idx + 1, liveBeats.length - 1), 0.14 + idx * 0.24, 0.36);
@@ -1023,6 +1029,30 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
           tl.fromTo(artwork, {{attr:{{viewBox:"0 0 944 760"}}}},
             {{attr:{{viewBox:x+" "+y+" 840 676"}}, duration:duration/2, yoyo:true, repeat:1,
               ease:"power2.inOut", immediateRender:false}}, t);
+        }} else if (ev.action === "move") {{
+          tl.set(el, {{opacity:1}}, t);
+          const dx = Number(ev.value?.[0] || 0), dy = Number(ev.value?.[1] || 0);
+          tl.to(el, {{x:dx, y:dy, duration, ease:"power2.inOut"}}, t);
+        }} else if (ev.action === "scale") {{
+          tl.set(el, {{opacity:1}}, t);
+          const sx = Number(ev.value?.[0] || 1), sy = Number(ev.value?.[1] || 1);
+          tl.to(el, {{scaleX:sx, scaleY:sy, transformOrigin:"50% 50%", duration, ease:"power2.inOut"}}, t);
+        }} else if (ev.action === "pulse") {{
+          tl.set(el, {{opacity:1}}, t);
+          tl.to(el, {{scaleX:"*=1.12", scaleY:"*=1.12", transformOrigin:"50% 50%",
+            duration:duration/4, yoyo:true, repeat:3, ease:"sine.inOut"}}, t);
+        }} else if (ev.action === "sequence") {{
+          const dest = artwork.querySelector('[data-ev="' + ev.value + '"]');
+          if (dest) {{
+            tl.set(el, {{opacity:1}}, t);
+            const sBBox = el.getBBox(), dBBox = dest.getBBox();
+            const dx = dBBox.x + dBBox.width/2 - sBBox.x - sBBox.width/2;
+            const dy = dBBox.y + dBBox.height/2 - sBBox.y - sBBox.height/2;
+            tl.set(el, {{x:0, y:0}}, t);
+            tl.to(el, {{x:dx, y:dy, duration, ease:"power2.inOut"}}, t);
+            const fade = Math.min(0.12, duration / 3);
+            tl.to(el, {{opacity:0, duration:fade}}, t + duration - fade);
+          }}
         }} else {{
           tl.to(el, {{opacity:ev.action === "exit" ? 0 : 1, duration, ease:"power2.out"}}, t);
         }}
@@ -1202,6 +1232,15 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
         }}
       }} else if (ev.action === "drag") {{
         tl.to(el, {{x:16, y:-10, duration:dEv, ease:"power2.inOut", yoyo:true, repeat:1}}, tEv);
+      }} else if (ev.action === "move") {{
+        tl.to(el, {{x:Number(ev.value?.[0]||0), y:Number(ev.value?.[1]||0), duration:dEv, ease:"power2.inOut"}}, tEv);
+      }} else if (ev.action === "scale") {{
+        tl.to(el, {{scaleX:Number(ev.value?.[0]||1), scaleY:Number(ev.value?.[1]||1), transformOrigin:"50% 50%", duration:dEv, ease:"back.out(1.4)"}}, tEv);
+      }} else if (ev.action === "pulse") {{
+        tl.to(el, {{scale:1.12, transformOrigin:"50% 50%", duration:dEv*0.25, yoyo:true, repeat:3, ease:"sine.inOut"}}, tEv);
+      }} else if (ev.action === "sequence") {{
+        tl.to(el, {{x:Number(ev.value?.[0]||0), y:Number(ev.value?.[1]||0), duration:dEv, ease:"power2.inOut"}}, tEv);
+        tl.to(el, {{opacity:0, duration:0.14}}, tEv + dEv - 0.14);
       }} else if (ev.action === "exit") {{
         tl.to(el, {{opacity:0.35, duration:dEv}}, tEv);
       }}
@@ -1230,6 +1269,14 @@ def _procedural_script(sid, model, events):
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = T.PCFSoftShadowMap;
     mount.append(renderer.domElement);
+    const labels = (model.labels || []).map(({position,text}) => {
+      const element = document.createElement("span");
+      element.className = "vrs-model-label";
+      element.textContent = text;
+      mount.append(element);
+      return {element, position:new T.Vector3().fromArray(position)};
+    });
+    const projection = new T.Vector3();
     world.add(new T.HemisphereLight(0xe5f2ff, 0x776656, 2));
     for (const [position, color, intensity] of [
       [[-4, 9, 6], 0xfff0d9, 3], [[4, 4, -6], 0xcceaff, 2.3], [[0, 2, 8], 0xdbe9ff, 0.7]
@@ -1316,7 +1363,8 @@ def _procedural_script(sid, model, events):
       }
       const opacity = part.opacity ?? 1;
       const material = new T.MeshStandardMaterial({
-        color:part.color, metalness:part.metalness ?? 0.16, roughness:part.roughness ?? 0.48,
+        color:part.color, emissive:part.color, emissiveIntensity:part.emission ?? 0,
+        metalness:part.metalness ?? 0.16, roughness:part.roughness ?? 0.48,
         roughnessMap:finish(part.texture),
         transparent:opacity<1, opacity, depthWrite:opacity===1
       });
@@ -1325,10 +1373,16 @@ def _procedural_script(sid, model, events):
       mesh.receiveShadow = true;
       (part.fixed ? world : assembly).add(mesh);
       parts.set(part.id,mesh);
+      const visibilityCue = model.events.find(event=>
+        event.target===part.id && (event.action==="reveal" || event.action==="hide"));
       initial.set(part.id,{position:part.position || [0,0,0],rotation:radians(part.rotation || [0,0,0]),
-        hidden:model.events.some(event=>event.target===part.id && event.action==="reveal")});
+        hidden:visibilityCue?.action==="reveal"});
     }
     const ease = gsap.parseEase("power2.inOut");
+    const look = new T.Vector3().fromArray(model.look);
+    const cameraOffset = new T.Vector3();
+    const fromOrbit = new T.Spherical();
+    const toOrbit = new T.Spherical();
     function draw(seconds) {
       const elapsed = seconds - scene.start;
       camera.position.fromArray(model.eye);
@@ -1343,10 +1397,20 @@ def _procedural_script(sid, model, events):
       for (const event of model.events) {
         if (elapsed < event.at) break;
         const p = ease(Math.min(1,(elapsed-event.at)/event.duration));
-        if (event.action === "camera") camera.position.lerp(new T.Vector3().fromArray(event.value),p);
-        else {
+        if (event.action === "camera") {
+          camera.position.lerp(cameraOffset.fromArray(event.value), p);
+        } else if (event.action === "camera-orbit") {
+          fromOrbit.setFromVector3(cameraOffset.copy(camera.position).sub(look));
+          toOrbit.setFromVector3(cameraOffset.fromArray(event.value).sub(look));
+          const delta = toOrbit.theta - fromOrbit.theta;
+          fromOrbit.theta += p * Math.atan2(Math.sin(delta), Math.cos(delta));
+          fromOrbit.phi += p * (toOrbit.phi - fromOrbit.phi);
+          fromOrbit.radius += p * (toOrbit.radius - fromOrbit.radius);
+          camera.position.setFromSpherical(fromOrbit.makeSafe()).add(look);
+        } else {
           const mesh=event.target==="assembly" ? assembly : parts.get(event.target);
-          if (event.action === "reveal") mesh.scale.setScalar(Math.max(.001,p));
+          if (event.action === "reveal") mesh.scale.setScalar(p);
+          if (event.action === "hide") mesh.scale.setScalar(1-p);
           if (event.action === "move") mesh.position.lerp(new T.Vector3().fromArray(event.value),p);
           if (event.action === "rotate") {
             const target=radians(event.value);
@@ -1357,8 +1421,15 @@ def _procedural_script(sid, model, events):
           }
         }
       }
-      camera.lookAt(...model.look);
+      camera.lookAt(look);
       renderer.render(world,camera);
+      const scale = Math.min(mount.clientWidth / width, mount.clientHeight / height);
+      for (const {element,position} of labels) {
+        projection.copy(position).project(camera);
+        element.hidden = Math.abs(projection.x) > .89 || Math.abs(projection.y) > .9 || Math.abs(projection.z) > 1;
+        element.style.left = (mount.clientWidth + projection.x * width * scale) / 2 + "px";
+        element.style.top = (mount.clientHeight - projection.y * height * scale) / 2 + "px";
+      }
     }
     draw(scene.start);
     window.addEventListener("hf-seek", event => {
@@ -1804,6 +1875,7 @@ def _render_component_html_and_js(
         extra_js = _procedural_script(sid, model, events)
         # The WebGL listener drives model motion from the same seek time as the GSAP timeline.
         storyboard["events"] = []
+        storyboard["model"] = model
     elif component == "semantic-artwork":
         body = _artwork_markup(storyboard)
     elif component == "comparison_split":

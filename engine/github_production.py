@@ -18,7 +18,7 @@ from zipfile import ZipFile, ZIP_DEFLATED, ZIP_STORED
 
 import cloud
 import github_credentials
-from remote_protocol import MANIFEST_LIMIT, MAX_FILES, copy_bounded, copy_pipe, extract_package, hash_file, safe_path, valid_id
+from remote_protocol import MANIFEST_LIMIT, MAX_FILES, copy_bounded, copy_pipe, extract_package, hash_file, job_id, safe_path, valid_id
 
 REPOSITORY = "manishtesting97/viral-reel-studio-private"
 RENDERER = "manishtesting97/viral-reel-studio-render"
@@ -525,7 +525,8 @@ def receive_preparation(receipt, run, root, limit):
     return prepared, metrics
 
 
-def runner_fetch(job, request, expected_operation=None, expected_recovery=None, *, metadata_only=False):
+def runner_fetch(job, request, expected_operation=None, expected_recovery=None, expected_apex=None, *,
+                 metadata_only=False):
     check_repo(runner=True)
     name = tag(request)
     matches = [draft for draft in api(f"{BASE}/releases?per_page=100", runner=True)
@@ -545,16 +546,23 @@ def runner_fetch(job, request, expected_operation=None, expected_recovery=None, 
             or assets[0]["digest"] != "sha256:" + checksum
             or assets[0]["state"] != "uploaded" or not 0 < assets[0]["size"] <= LIMIT):
         raise ValueError("Private input release does not match the production dispatch.")
-    if operation not in {"transcribe", "prepare", "render"}:
+    if operation not in {"transcribe", "prepare", "render", "produce"}:
         raise ValueError("Unsupported hybrid workflow operation.")
     recovery = descriptor.get("recovery", False)
     if type(recovery) is not bool or (recovery and operation != "transcribe"):
         raise ValueError("Invalid recovery mode.")
+    apex_eligible = descriptor.get("apexEligible", False)
+    if type(apex_eligible) is not bool or (apex_eligible and operation != "produce"):
+        raise ValueError("Invalid automatic recognition runtime selection.")
     if metadata_only:
         print(f"operation={operation}\nrecovery={str(recovery).lower()}")
+        if operation == "produce":
+            print(f"apex_eligible={str(apex_eligible).lower()}")
         return
     if expected_operation is not None and (operation, str(recovery).lower()) != (expected_operation, expected_recovery):
         raise ValueError("Private draft operation changed after prerequisite selection.")
+    if expected_apex is not None and str(apex_eligible).lower() != expected_apex:
+        raise ValueError("Private draft recognition prerequisites changed.")
     asset_id = assets[0]["id"]
     job.mkdir(mode=0o700)
     archive = job / ASSET
@@ -574,25 +582,31 @@ def runner_fetch(job, request, expected_operation=None, expected_recovery=None, 
                 or ("recovery.json" in data["files"]) != recovery
                 or any(name not in {"voice.wav", "recovery.json"} for name in data["files"])):
             raise ValueError("Private production package is missing required transcription inputs.")
-    elif operation == "prepare":
+    elif operation in {"prepare", "produce"}:
         slug = descriptor.get("project")
-        if (data["operation"] != "prepare" or preset is not None or data["preset"] is not None
+        if (data["operation"] != operation or data["preset"] != preset
+                or (operation == "prepare" and preset is not None)
                 or data["language"] is not None or data["revision"] != descriptor.get("revision")
                 or not isinstance(slug, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", slug)
                 or f"projects/{slug}/plan.json" not in data["files"]):
             raise ValueError("Private production package is missing required scene preparation inputs.")
     else:
         raise ValueError("Unsupported hybrid workflow operation.")
+    if operation == "produce":
+        prefix = f"projects/{slug}/"
+        if (not {prefix + name for name in ("plan.json", "brief.json", "voice.wav")} <= data["files"].keys()
+                or any(name.startswith("projects/") and not name.startswith(prefix) for name in data["files"])):
+            raise ValueError("Invalid automatic production workspace.")
     (job / "manifest.json").write_text(json.dumps(data))
     archive.unlink()
     (job / "transfer.json").write_text(json.dumps({
         "release": item["id"], "inputSha": checksum, "manifest": manifest,
         "operation": operation, "request": request, "sha": descriptor["sha"],
         "run": int(os.environ["GITHUB_RUN_ID"]),
-        **({"revision": data["revision"]} if operation in {"transcribe", "prepare"} else {}),
+        **({"revision": data["revision"]} if operation in {"transcribe", "prepare", "produce"} else {}),
         **({"project": descriptor["project"], "mode": descriptor.get("mode"),
             "sceneId": descriptor.get("sceneId"), "force": bool(descriptor.get("force"))}
-           if operation == "prepare" else {}),
+           if operation in {"prepare", "produce"} else {}),
     }))
 
 
@@ -928,10 +942,242 @@ def runner_render(job):
         **({"captionsAssSha256": hash_file(delivery / "captions.ass")} if (delivery / "captions.ass").is_file() else {}),
         captureSeconds=events["encode"]-events["capture"],
         encodingSeconds=events["verify"]-events["encode"], cpus=os.cpu_count(),
-        chrome=output(["/opt/google/chrome/chrome", "--version"]).strip(),
+        chrome=output([os.environ.get("VRS_REMOTE_BROWSER") or "/opt/google/chrome/chrome", "--version"]).strip(),
         ffmpeg=output(["ffmpeg", "-version"]).splitlines()[0],
     )
     (delivery / "render-metrics.json").write_text(json.dumps(metrics))
+
+
+def _has_apex_recovery(project, plan, report=None):
+    from production_plan import load
+    import production_plan
+
+    info = report if isinstance(report, dict) else production_plan.current_alignment_report(project / "voice.wav", plan)
+    if isinstance(info.get("targetedRecovery"), dict) and info["targetedRecovery"].get("model") == "apex-ct2-int8":
+        return True
+    cache = str(info.get("recognitionCache") or "")
+    if cache.startswith(".whisper-") and cache.endswith(".json"):
+        rec_path = project / (cache.removesuffix(".json") + "-recovery-v1.json")
+        if rec_path.is_file() and load(rec_path).get("model") == "apex-ct2-int8":
+            return True
+    return False
+
+
+def _missing_phrase_anchors(plan, timing, caption_review):
+    import production_plan
+
+    words_src = (timing or {}).get("words") if isinstance(timing, dict) else caption_review.get("matches", [])
+    by_scene = {}
+    for w in words_src or []:
+        sid = w.get("scene")
+        if sid:
+            by_scene.setdefault(sid, []).extend(
+                production_plan.normalized(tok) for tok in str(w.get("text", "")).split()
+                if production_plan.normalized(tok)
+            )
+    for scene in plan.get("scenes", []):
+        tokens = by_scene.get(scene.get("id"), [])
+        storyboard = scene.get("storyboard", {})
+        events = storyboard.get("model", storyboard.get("artwork", {})).get("events", [])
+        for ev in events:
+            anchor = str(ev.get("anchor") or "").strip()
+            if not anchor:
+                continue
+            need = [production_plan.normalized(t) for t in anchor.split() if production_plan.normalized(t)]
+            if need and not any(tokens[i:i + len(need)] == need for i in range(max(0, len(tokens) - len(need) + 1))):
+                return True
+    return False
+
+
+def _needs_apex_recovery(project, plan, caption_review, *, timing=None):
+    from alignment import QUALITY_FLOOR
+    from production_plan import probe_duration
+
+    voice = project / "voice.wav"
+    if (plan.get("language") not in {"hi", "hinglish"} or not voice.is_file()
+            or not caption_review.get("scriptWords")):
+        return False
+    # Trigger on any real readiness failure (never solely on raw overall script coverage when readiness passes).
+    reliable = caption_review.get("verifiedCoverage", caption_review.get("reliableCoverage"))
+    has_failure = (
+        not timing
+        or caption_review.get("status") == "failed"
+        or caption_review.get("premiumCaptionReady") is False
+        or bool(caption_review.get("pendingSceneOpenings"))
+        or bool(caption_review.get("unmatched"))
+        or bool(caption_review.get("requiredTimingReviews"))
+        or (reliable is not None and reliable < QUALITY_FLOOR)
+        or _missing_phrase_anchors(plan, timing, caption_review)
+    )
+    if not has_failure:
+        return False
+    return probe_duration(voice) <= 180 and not _has_apex_recovery(project, plan, caption_review)
+
+
+def _write_recovery_spec(stage_dir, project, plan):
+    import production_plan
+    from production_plan import probe_duration, save
+
+    voice = project / "voice.wav"
+    duration = probe_duration(voice)
+    report = production_plan.current_alignment_report(voice, plan)
+    matches = report.get("matches", []) if isinstance(report, dict) else []
+    windows = (production_plan.recovery_windows(plan["scenes"], matches, duration)
+               if matches else [[0.0, round(duration, 2), True]])
+    spec = {
+        "model": "apex-ct2-int8",
+        "scenes": [{"id": s["id"], "start": s["start"], "end": s["end"], "narration": s["narration"]}
+                   for s in plan.get("scenes", [])],
+        "windows": windows,
+    }
+    save(stage_dir / "recovery.json", spec)
+
+
+PRODUCE_FILES = {
+    "state.json", "timeline.json", "alignment-report.json", "visual-config.json",
+    "captions.ass", "final.mp4", "visual-only.mp4", "captioned-silent.mp4", "render-metrics.json",
+}
+
+
+def produce_output_name(name):
+    path = safe_path(name)
+    return name in PRODUCE_FILES or (len(path.parts) > 1 and path.parts[0] in {"visuals", "prompts"})
+
+
+def runner_produce(job, phase):
+    transfer = json.loads((job / "transfer.json").read_text())
+    if transfer["operation"] != "produce":
+        raise ValueError("Unexpected automatic production step.")
+    cache = job / "workspace-cache"
+    cache.mkdir(exist_ok=True)
+    subprocess.run([sys.executable, __file__, "_produce", str(job), phase], check=True, env={
+        **os.environ, "VRS_WORKSPACE": str(job / "input"), "VRS_CACHE_DIR": str(cache),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+
+
+def produce_stage(job, phase):
+    from caption_review import current_caption_state, require_caption_timing
+    from production_plan import PROJECTS, SCHEMA, align, load, save, validate
+    from production_render import scene_prompts
+    from remote_client import pack_project
+    import visual_generator
+
+    transfer = load(job / "transfer.json")
+    manifest = load(job / "manifest.json")
+    project = PROJECTS / transfer["project"]
+    plan = load(project / "plan.json")
+    validate(plan, load(SCHEMA))
+    delivery = job / "delivery"
+    delivery.mkdir(exist_ok=True)
+    state_path = delivery / "state.json"
+
+    def checkpoint(status):
+        for name in ("timeline.json", "alignment-report.json"):
+            src = project / name
+            if src.is_file():
+                shutil.copyfile(src, delivery / name)
+        save(state_path, {"status": status, "manifest": transfer["manifest"], "run": transfer["run"],
+                          "revision": transfer["revision"], "inputSha": transfer["inputSha"]})
+
+    if phase in {"speech", "recovery"}:
+        timing, report = current_caption_state(project, plan)
+        if phase == "recovery" and not (job / "needs-apex").is_file():
+            return
+        fresh = not timing and not report.get("captionRevision")
+        if phase == "recovery" or fresh:
+            recognition = job / phase
+            inputs = recognition / "input"
+            inputs.mkdir(parents=True)
+            shutil.copyfile(project / "voice.wav", inputs / "voice.wav")
+            if phase == "recovery":
+                _write_recovery_spec(inputs, project, plan)
+            save(recognition / "transfer.json", transfer)
+            save(recognition / "manifest.json", {**manifest, "language": plan["language"]})
+            runner_transcribe(recognition)
+            data = load(recognition / "delivery" / "transcript.json")
+            if phase == "recovery" and data.get("model") != "apex-ct2-int8":
+                raise ValueError("Requested Apex checkpoint is unavailable.")
+            try:
+                align(project, plan, model_name=data["model"], remote_words=data["words"],
+                      remote_recognition=data["recognition"], remote_recovery=data.get("recovery"),
+                      remote_alternate=({"words": data["alternate"], "recognition": data["alternateRecognition"]}
+                                        if "alternate" in data else None))
+            except ValueError:
+                if load(project / "alignment-report.json").get("status") != "failed":
+                    raise
+        timing, report = current_caption_state(project, plan)
+        if phase == "speech" and _needs_apex_recovery(project, plan, report, timing=timing):
+            (job / "needs-apex").touch()
+            checkpoint("recovery")
+            return
+        checkpoint("aligned" if timing and report.get("premiumCaptionReady") is not False else "caption-review")
+        return
+
+    state = load(state_path)["status"]
+    if phase == "compose":
+        if state != "aligned":
+            return
+        timing, _ = require_caption_timing(project, plan)
+        status = visual_generator.visual_status(project, plan, timing)
+        if (status["hasCustomScenes"] or status["mode"] == "custom"
+                or any(scene["status"] == "present" for scene in status["scenes"])):
+            checkpoint("scene-review")
+            return
+        result = visual_generator.generate_visuals(project)
+        if not result["validation"]["ok"]:
+            raise ValueError("Automatic scene validation failed.")
+        scene_prompts(project, plan, timing)
+        for name in ("visuals", "prompts"):
+            shutil.copytree(project / name, delivery / name)
+        shutil.copyfile(project / "visual-config.json", delivery / "visual-config.json")
+        checkpoint("composed")
+        return
+
+    if phase != "capture":
+        raise ValueError("Unexpected automatic production phase.")
+    if state != "composed":
+        return
+    render_job = job / "capture"
+    render_job.mkdir()
+    archive = render_job / "render-input.zip"
+    data = pack_project(project.name, project / "visuals", archive, manifest["preset"], LIMIT, production_audio=True)
+    extract_package(archive, render_job / "input", LIMIT, job_id(data))
+    archive.unlink()
+    save(render_job / "manifest.json", data)
+    save(render_job / "transfer.json", transfer)
+    runner_render(render_job)
+    for path in (render_job / "delivery").iterdir():
+        shutil.move(path, delivery / path.name)
+    checkpoint("complete")
+
+
+def receive_production(receipt, run, root, limit):
+    archive = _download_delivery(receipt, root, limit)
+    result = root / "production"
+    result.mkdir()
+    with ZipFile(archive) as zipped:
+        entries = zipped.infolist()
+        if (not 0 < len(entries) <= MAX_FILES or len({i.filename for i in entries}) != len(entries)
+                or sum(i.file_size for i in entries) > limit):
+            raise ValueError("Invalid automatic production archive inventory.")
+        for info in entries:
+            name = info.filename
+            if (name != info.orig_filename or not produce_output_name(name) or info.is_dir() or info.flag_bits & 1
+                    or stat.S_IFMT(info.external_attr >> 16) not in {0, stat.S_IFREG}
+                    or (name in {"state.json", "render-metrics.json"} and info.file_size > 65536)):
+                raise ValueError("Invalid automatic production archive entry.")
+            destination = result / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with zipped.open(info) as src, destination.open("xb") as out:
+                copy_bounded(src, out, info.file_size)
+    state = json.loads((result / "state.json").read_text())
+    if (state.get("run") != run["id"] or any(state.get(key) != receipt[key]
+            for key in ("manifest", "inputSha", "revision"))):
+        raise ValueError("Automatic production checkpoint does not match the approved run.")
+    if state.get("status") not in {"complete", "caption-review", "scene-review", "aligned", "composed", "recovery"}:
+        raise ValueError("Unknown automatic production checkpoint.")
+    return result, state["status"]
 
 
 def runner_upload(job):
@@ -962,6 +1208,18 @@ def runner_upload(job):
             (manifest_file, "prepare-manifest.json", MANIFEST_LIMIT),
             (delivery / "prepare-metrics.json", "prepare-metrics.json", 65536),
         ]
+    elif operation == "produce":
+        files = []
+        for path in sorted(delivery.rglob("*")):
+            name = path.relative_to(delivery).as_posix()
+            if path.is_symlink():
+                raise ValueError("Invalid private production output.")
+            if path.is_file():
+                if not produce_output_name(name):
+                    raise ValueError("Unexpected private production output.")
+                files.append((path, name, LIMIT))
+        if not 0 < len(files) <= MAX_FILES or sum(path.stat().st_size for path, _, _ in files) > LIMIT:
+            raise ValueError("Private production output exceeds limits.")
     elif operation == "render":
         files = [(delivery / name, name, maximum) for name, maximum in (("final.mp4", LIMIT), ("render-metrics.json", 65536))]
         for extra in ("visual-only.mp4", "captioned-silent.mp4", "captions.ass"):
@@ -1033,7 +1291,12 @@ if __name__ == "__main__":
         elif mode == "metadata":
             runner_fetch(Path(folder), *args, metadata_only=True)
         elif mode == "execute":
-            runner_execute(Path(folder))
+            if args:
+                runner_produce(Path(folder), *args)
+            else:
+                runner_execute(Path(folder))
+        elif mode == "_produce":
+            produce_stage(Path(folder), *args)
         elif mode == "_prepare":
             _prepare_workspace(Path(folder))
         elif mode == "render":

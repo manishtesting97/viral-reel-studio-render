@@ -89,6 +89,15 @@ def validate(value, rule, path="$", *, schema=None):
     schema = rule if schema is None else schema
     if "$ref" in rule:
         rule = schema["$defs"][rule["$ref"].removeprefix("#/$defs/")]
+    if "anyOf" in rule:
+        for option in rule["anyOf"]:
+            try:
+                validate(value, option, path, schema=schema)
+            except ValueError:
+                continue
+            break
+        else:
+            raise ValueError(f"{path}: value does not match any permitted shape")
     kind = rule.get("type")
     valid = {
         "object": type(value) is dict,
@@ -253,8 +262,8 @@ def production_prompt(project, config, badge=None):
           "A loft follows local X and uses sections [x, centerY, centerZ, radiusY, radiusZ] in increasing X order with positive radii; "
           "use size [1,1,1] for a loft. Tube points are 3D coordinates and size[0] is the tube diameter. For torus specify "
           "outer X diameter and tube Z diameter. For other primitives use full dimensions. Reuse relevant project or licensed library media. "
-          "Model events use exact spoken anchors. Reveal takes value [0,0,0]; move, rotate and camera take destination vectors. "
-          "Use target camera to move the eye and assembly to move or rotate the whole model. "
+          "Model events use exact spoken anchors. Reveal and hide take value [0,0,0]; move, rotate and camera take destination vectors. Use low emission for status LEDs and packets. Use optional model.labels with text and 3D positions for essential identifiers, and model.entrance for cut, fade or slide. "
+          "Use target camera with camera for a straight move or camera-orbit for an arc around the fixed look point. Use assembly to move or rotate the whole model. "
           "Use supported moves and rotations for cutaways, exploded views and changes of state. Use deliberate camera "
           "push-ins or perspective changes to reveal relationships. Vary staging and avoid repeated entrances. "
           "For detailed 2D or original interface scenes supply `storyboard.artwork` with named layers of shapes that actually depict "
@@ -267,8 +276,8 @@ def production_prompt(project, config, badge=None):
           "In artwork.events target a layer ID and quote the exact spoken anchor, with occurrence for repeated phrases. "
           "Use a few meaningful reveals, highlights, exits, typed text, drawn connections or transforms. "
           "A transform's value is the destination layer ID. The destination stays hidden until the swap. "
-          "Use highlight for brief object emphasis or focus for a bounded camera push-in. "
-          "Use an explicit scene-relative at only for an unspoken beat. "
+          "Use highlight for object emphasis or focus for a bounded push-in. Use move with [dx,dy] in illustration pixels, scale with [sx,sy] about the layer center, pulse for a brief scale accent, and sequence with the destination layer ID to send a token to an already visible object. "
+          "Use artwork.entrance cut for immediate framing, fade for a gentle reveal, or slide for an explanatory scene opener. Preserve spatial continuity when cutting between views of the same system. Use an explicit scene-relative at only for an unspoken beat. "
           "Compose original diagrams, illustrations or interface details. Draw the mechanism and its state changes "
           "with purposeful labels. Omit decorative metrics, filler cards and unrelated symbols. "
           "If a scene needs true 3D or missing assets and cannot be illustrated faithfully, set storyboard.limitation "

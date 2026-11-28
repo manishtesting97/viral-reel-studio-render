@@ -20,7 +20,8 @@ SEMANTIC_ACTIONS = (
 )
 
 _TOKEN_RE = re.compile(r"[^\W_][\w\u0900-\u097f']*", re.UNICODE)
-ARTWORK_ACTIONS = {"reveal", "type", "connect", "highlight", "focus", "transform", "exit"}
+ARTWORK_ACTIONS = {"reveal", "type", "connect", "highlight", "focus", "transform", "exit",
+                   "move", "scale", "pulse", "sequence"}
 _PATH_TOKEN = re.compile(r"[A-Za-z]|[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 _PATH_ARITY = {"M": 2, "L": 2, "H": 1, "V": 1, "C": 6, "S": 4, "Q": 4, "T": 2, "A": 7, "Z": 0}
 
@@ -91,12 +92,13 @@ def validate_model(scene):
             raise ValueError(f"{sid}: points apply to tube geometry.")
     tokens = _tokenize(scene["narration"])
     for event in model.get("events", []):
-        targets = {"camera"} if event["action"] == "camera" else ids | {"assembly"}
-        if event["target"] not in targets or (event["action"] == "reveal" and event["target"] == "assembly"):
+        camera_event = event["action"] in {"camera", "camera-orbit"}
+        targets = {"camera"} if camera_event else ids | {"assembly"}
+        if event["target"] not in targets or (event["action"] in {"reveal", "hide"} and event["target"] == "assembly"):
             raise ValueError(f"{sid}: unknown procedural model target {event['target']}.")
         if event["action"] != "rotate" and max(map(abs, event["value"])) > 24:
             raise ValueError(f"{sid}: model event position exceeds the scene bounds.")
-        if event["action"] == "camera" and sum((a-b)**2 for a,b in zip(event["value"], model["look"])) < 1:
+        if camera_event and sum((a-b)**2 for a,b in zip(event["value"], model["look"])) < 1:
             raise ValueError(f"{sid}: camera destination is too close to the subject.")
         phrase = _tokenize(event["anchor"])
         if not phrase or len(_phrase_starts(tokens, phrase)) < event.get("occurrence", 1):
@@ -161,8 +163,16 @@ def validate_artwork(scene):
         action, target = ev["action"], ev["target"]
         if action not in ARTWORK_ACTIONS or target not in layers:
             raise ValueError(f"{sid}: unsupported artwork action or unknown target: {action} / {target}.")
-        if action == "transform" and (ev.get("value") not in layers or ev["value"] == target):
+        if action == "transform" and (not isinstance(ev.get("value"), str) or ev["value"] not in layers or ev["value"] == target):
             raise ValueError(f"{sid}: transform needs a different destination layer ID in value.")
+        if action == "move" and (not isinstance(ev.get("value"), list) or len(ev["value"]) != 2
+                                  or any(abs(v) > 400 for v in ev["value"])):
+            raise ValueError(f"{sid}: move needs [dx, dy] within ±400.")
+        if action == "scale" and (not isinstance(ev.get("value"), list) or len(ev["value"]) != 2
+                                   or any(v < 0.1 or v > 3.0 for v in ev["value"])):
+            raise ValueError(f"{sid}: scale needs [sx, sy] in 0.1–3.0.")
+        if action == "sequence" and (not isinstance(ev.get("value"), str) or ev["value"] not in layers or ev["value"] == target):
+            raise ValueError(f"{sid}: sequence needs a different destination layer ID in value.")
         if action == "connect" and not any(s["type"] == "path" and s.get("stroke", "none") != "none"
                                            for s in layers[target]):
             raise ValueError(f"{sid}: connect needs a stroked path on layer {target}.")
