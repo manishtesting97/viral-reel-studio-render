@@ -132,8 +132,62 @@ def validate(value, rule, path="$", *, schema=None):
         raise ValueError(f"{path}: out of range")
 
 
+BUILTIN_STYLES = ("isometric-tech", "editorial-motion", "warm-editorial", "premium-3d")
+MOBILE_STYLE = {
+    "background": "#f6f7fb",
+    "heading": {"headingSize": 80, "headingColor": "#181412", "alignment": "center"},
+    "captions": {"size": 90, "marginBottom": 340, "wordsPerGroup": 4,
+                 "highlight": "#FFD400", "textColor": "#FFFFFF", "box": False,
+                 "highlighter": False, "autoContrast": False, "outline": 5, "shadow": 3},
+    "username": {"size": 28, "color": "#181412"},
+    "scale2d": 1.0,
+    "scale3d": 1.28,
+}
+
+
+def validate_template(value):
+    def check(item, default, key):
+        if isinstance(default, dict):
+            if not isinstance(item, dict) or item.keys() != default.keys():
+                raise ValueError(f"Invalid template fields in {key}.")
+            for field in default:
+                check(item[field], default[field], field)
+        elif isinstance(default, bool):
+            if type(item) is not bool:
+                raise ValueError(f"{key} must be on or off.")
+        elif isinstance(default, (int, float)):
+            limits = {"headingSize": (60, 94), "size": (22, 96), "marginBottom": (300, 750),
+                      "wordsPerGroup": (1, 5), "outline": (0, 9), "shadow": (0, 8),
+                      "scale2d": (.8, 1.05), "scale3d": (1, 1.35)}
+            low, high = limits[key]
+            if type(item) not in ((int,) if isinstance(default, int) else (int, float)) or not low <= item <= high:
+                raise ValueError(f"{key} must be between {low} and {high}.")
+        elif default.startswith("#"):
+            if not isinstance(item, str) or not re.fullmatch(r"#[a-fA-F0-9]{6}", item):
+                raise ValueError(f"{key} requires a six-digit hex color.")
+        elif item not in ("left", "center", "right"):
+            raise ValueError(f"Invalid {key}.")
+
+    check(value, MOBILE_STYLE, "visual settings")
+    if value["captions"]["size"] < 54 or value["username"]["size"] > 40:
+        raise ValueError("Caption size must be at least 54 px and username size at most 40 px.")
+    return value
+
+
+def read_style(style_id):
+    if not isinstance(style_id, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", style_id):
+        raise ValueError("Invalid template ID.")
+    path = STYLE_LIB / f"{style_id}.json"
+    if not path.is_file():
+        raise ValueError(f"Unknown template: {style_id}")
+    return load(path)
+
+
 def profiles(config, project=None):
     style_id = config["style"]
+    snapshot = None
+    if project is not None and (Path(project) / "brief.json").is_file():
+        snapshot = load(Path(project) / "brief.json").get("templateSnapshot")
     if project is not None:
         vc_path = Path(project) / "visual-config.json"
         if vc_path.is_file():
@@ -144,7 +198,13 @@ def profiles(config, project=None):
                     style_id = override
             except Exception:
                 pass
-    return load(BRAND_DIR / f"{config['brand']}.json"), load(STYLE_LIB / f"{style_id}.json")
+    if isinstance(snapshot, dict) and snapshot.get("id") == style_id:
+        style = snapshot
+    else:
+        style = read_style(style_id)
+    if "mobile" in style:
+        validate_template(style["mobile"])
+    return load(BRAND_DIR / f"{config['brand']}.json"), style
 
 
 def init_project(project, config):
@@ -153,8 +213,8 @@ def init_project(project, config):
         validate(config[key], schema["properties"][key], key)
     if project.exists():
         raise ValueError("Project already exists. Resume using its saved files.")
-    profiles(config)
-    save(project / "brief.json", config)
+    _, style = profiles(config)
+    save(project / "brief.json", {**config, "templateSnapshot": style})
     write_prompt(project, config)
 
 
@@ -165,7 +225,8 @@ def write_prompt(project, config, badge=None):
 def production_prompt(project, config, badge=None):
     from sponsorship import prompt_context
 
-    brand, style = profiles(config)
+    brand, style = profiles(config, project=project)
+    config = {key: config[key] for key in CONFIG}
     existing_plan = project / "plan.json"
     sponsor_context = prompt_context(project, load(existing_plan) if existing_plan.is_file() else None)
     prefs = preferences(director_state(project).get("preferences", {}))
@@ -251,7 +312,7 @@ def production_prompt(project, config, badge=None):
           "apply the selected style across niches. Isometric Tech Grid favors detailed perspective objects, mechanisms, "
           "architecture and network flows. Warm Editorial Motion favors expressive pacing, dynamic typography and relatable "
           "illustrations. Warm Editorial Explainer favors clear diagrams, comparisons and step-by-step demonstrations. Use "
-          "the brand profile as identity. Asset entries are local relative filenames, never URLs. "
+          "the brand profile as identity. Use short topic-specific headings (prefer two to four words, up to six), a strong opening hook, and large explanatory visuals clear of captions and branding. Asset entries are local relative filenames, never URLs. "
           "Choose the best visual medium for each explanatory scene. For subjects that benefit from depth, perspective or moving parts, "
           "supply storyboard.model with named box, sphere, cylinder, torus, loft or tube parts and appropriate materials and finishes. "
           "Build recognizable objects with accurate proportions, layered structures and relevant details. Use supported "

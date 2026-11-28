@@ -189,7 +189,7 @@ def validate_studio_bundle(project, plan, base, timing, dark, standard, approved
 def pack_project(slug, source, package, preset, limit, *, production_audio=False, approved_preview=None):
     from caption_review import require_caption_timing
     from production_plan import PROJECTS, SCHEMA, current_alignment_report, digest, load, save, validate
-    from production_render import profiles, source_files, stage, subtitles
+    from production_render import caption_settings, profiles, source_files, stage, subtitles
 
     schema=load(SCHEMA)
     validate(slug,schema["properties"]["id"],"project")
@@ -206,7 +206,7 @@ def pack_project(slug, source, package, preset, limit, *, production_audio=False
     tracks = [(cue, path) for cue, path in tracks if path.is_file()]
     if tracks and not production_audio:
         raise ValueError("Use local production for projects with separate audio tracks in protocol V1.")
-    if profiles(plan)[0].get("captions",{}).get("highlighter"):
+    if caption_settings(*profiles(plan, project=project)).get("highlighter"):
         try:
             import PIL.ImageFont
         except ImportError as error:

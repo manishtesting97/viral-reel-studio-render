@@ -99,7 +99,7 @@ def profile_assets(brand):
     return files
 
 
-def profile_markup(brand, photo, last_scene, duration):
+def profile_markup(brand, photo, last_scene, duration, *, mobile=False):
     if not photo:
         return "", ""
     text = {field: escape(str(brand.get(field, ""))) for field in
@@ -109,6 +109,8 @@ def profile_markup(brand, photo, last_scene, duration):
     img = f'<img src="{photo}" alt="" />'
     header = (f'<aside id="profile-header">{img}<div><strong>{name}</strong>'
               f'<small>{text["profileTitle"]}</small></div></aside>')
+    if mobile and handle:
+        header = f'<aside id="profile-header" class="mobile-profile">{img}<strong>{handle}</strong></aside>'
     if last_scene["id"] not in {"outro", "brand-outro"}:
         return header, ""
     start = last_scene["start"]
@@ -221,7 +223,14 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
     highlight = brand.get("captions", {}).get("highlight", "")
     if re.fullmatch(r"#[\da-fA-F]{6}", highlight):
         variables += f";--brand-highlight:{highlight}"
-    visual = {**style.get("layout", {}), **brand.get("layout", {})}
+    mobile = style.get("mobile", {})
+    visual = {**style.get("layout", {}), **brand.get("layout", {}), **mobile.get("heading", {})}
+    if mobile:
+        variables += f";--style-ground:{mobile['background']};--vrs-artwork-bottom:420px"
+        username = mobile.get("username", {})
+        variables += f";--vrs-username-size:{username.get('size', 28)}px;--vrs-username-color:{username.get('color', '#181412')}"
+        variables += f";--vrs-heading-align:{mobile.get('heading', {}).get('alignment', 'center')}"
+        variables += f";--vrs-artwork-scale:{mobile.get('scale2d', 1)}"
     caption_size, caption_margin = caption_geometry(brand, style)
     variables += f";--vrs-caption-clearance:{caption_size + caption_margin + 36}px"
     for setting, token in {"headerTop":"header-top", "headerLeft":"header-left",
@@ -238,7 +247,7 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
     hidden = "".join(selector + "{{display:none!important}}" for flag, selector in (
         ("headerVisible","#profile-header"), ("progressVisible",".k8s-progress-rail"),
         ("outroVisible","#profile-outro")) if visual.get(flag) is False).replace("{{","{").replace("}}","}")
-    overlay, motion = profile_markup(brand, brand_urls.get("profile"), timing["scenes"][-1], render_duration)
+    overlay, motion = profile_markup(brand, brand_urls.get("profile"), timing["scenes"][-1], render_duration, mobile=bool(mobile))
     header_bottom = max(330, visual.get("headerTop", 283) + visual.get("headerSize", 64) + 29) if (
         brand_urls.get("profile") and visual.get("headerVisible") is not False) else 330
     disclosures = sponsorship.panels(target, sponsor, partners, timing, render_duration, header_bottom)
@@ -259,6 +268,9 @@ body {{margin:0}}
 #profile-header img {{width:var(--vrs-header-size,64px);height:var(--vrs-header-size,64px);border-radius:50%;object-fit:cover}}
 #profile-header strong,#profile-header small {{display:block;font-size:29px;line-height:1.1}}
 #profile-header small {{font-size:19px;color:#484036}}
+#profile-header.mobile-profile {{padding:7px 16px 7px 7px;gap:10px}}
+#profile-header.mobile-profile img {{width:44px;height:44px}}
+#profile-header.mobile-profile strong {{font-size:var(--vrs-username-size);color:var(--vrs-username-color)}}
 #profile-outro {{top:470px;left:158px;right:158px;display:flex;flex-direction:column;align-items:center;
   gap:9px;text-align:center;font-size:31px;line-height:1.2}}
 #profile-outro .portrait {{padding:10px;border-radius:50%;background:conic-gradient(var(--brand-highlight,#ffd400),#fff1a6,var(--brand-highlight,#ffd400));
@@ -273,9 +285,22 @@ body {{margin:0}}
 </style>
 <main id="production" data-composition-id="production" data-start="0"
  data-duration="{render_duration:.9f}" data-width="{width}" data-height="{height}">
-<div id="stage">{''.join(layers)}{''.join(asset_layers)}{overlay}{disclosures}</div></main>
+<div id="stage" {"data-mobile-template" if mobile else ""}>{''.join(layers)}{''.join(asset_layers)}{overlay}{disclosures}</div></main>
 {''.join(scripts)}
 <script>
+if (document.getElementById("stage").style.getPropertyValue("--vrs-artwork-bottom")) {{
+  window.__hf = window.__hf || {{}};
+  window.__hf.buildReady = window.__hf.buildReady || {{}};
+  window.__hf.buildReady.templateTypography = document.fonts.ready.then(() => {{
+    for (const title of document.querySelectorAll(".vrs-auto-heading")) {{
+      let size = parseFloat(getComputedStyle(title).fontSize);
+      while (size > 60 && title.offsetHeight > size * 2.18) {{
+        size -= 2;
+        title.style.fontSize = Math.max(60, size) + "px";
+      }}
+    }}
+  }});
+}}
 // Measure the shared profile in composition pixels before laying out auto scenes.
 const profile = document.getElementById("profile-header");
 if (profile && document.querySelector(".vrs-auto-layout")) {{
@@ -376,9 +401,16 @@ def _pill_ass_path(w, h, r=14):
     )
 
 
+def caption_settings(brand, style):
+    mobile = style.get("mobile")
+    if mobile:
+        return {**brand.get("captions", {}), **mobile["captions"], "mode": "active-word"}
+    return brand.get("captions", {})
+
+
 def caption_geometry(brand, style):
-    caption = brand.get("captions", {})
-    size = min(84, max(36, int(caption.get("size", style.get("typography", {}).get("captionSizePx", 52)))))
+    caption = caption_settings(brand, style)
+    size = min(96 if style.get("mobile") else 84, max(36, int(caption.get("size", style.get("typography", {}).get("captionSizePx", 52)))))
     margin = min(900, max(260, int(caption.get("marginBottom", style.get("captions", {}).get("marginBottom", 690)))))
     return size, margin
 
@@ -386,7 +418,8 @@ def caption_geometry(brand, style):
 def subtitles(folder, plan, words, dark_scenes=None, *, project=None):
     brand, style = profiles(plan, project=project)
     dark_scenes = set(dark_scenes or ())
-    caption = brand.get("captions", {})
+    caption = caption_settings(brand, style)
+    mobile = style.get("mobile")
     words_per_group = min(6, max(1, int(caption.get("wordsPerGroup",
                           style.get("captions", {}).get("wordsPerGroup", 4)))))
     font_size, margin_v = caption_geometry(brand, style)
@@ -397,8 +430,8 @@ def subtitles(folder, plan, words, dark_scenes=None, *, project=None):
         else ("textColor" not in caption and "outline" not in caption)
     )
     border_style = 3 if use_box else 1
-    outline_px = 10 if use_box else (max(3, int(caption.get("outline", 3))) if adaptive else int(caption.get("outline", 0 if use_highlighter else 5)))
-    shadow_px = 0 if use_box else int(caption.get("shadow", 0 if use_highlighter else 3))
+    outline_px = (int(caption.get("outline", 5)) if mobile else 10) if use_box else (max(3, int(caption.get("outline", 3))) if adaptive else int(caption.get("outline", 0 if use_highlighter else 5)))
+    shadow_px = 0 if use_box and not mobile else int(caption.get("shadow", 0 if use_highlighter else 3))
     back_colour = "&H00191716" if use_box else "&H70181412"
     font = "Noto Sans Devanagari" if plan["language"] != "en" else "DejaVu Sans"
     lang = "hindi" if plan["language"] == "hi" else "english"
@@ -431,22 +464,23 @@ Style: Pill,Arial,10,&H00{bgr},&H00{bgr},&H00{bgr},&H00000000,0,0,0,0,100,100,0,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     pil_font, win_ratio = None, 0.565
-    if use_highlighter and active_mode and words and any(
+    if mobile or (use_highlighter and active_mode and words and any(
         scene["caption_style"] == "word" for scene in plan["scenes"]
-    ):
+    )):
         font_rel = font_cfg.get("bold") or font_cfg.get("regular")
-        if not font_rel:
+        if not font_rel and use_highlighter:
             raise ValueError("The caption highlighter requires a configured font file.")
-        font_abs = (BRAND_DIR / font_rel).resolve()
+        font_abs = (BRAND_DIR / font_rel).resolve() if font_rel else None
         try:
             from PIL import ImageFont
         except ImportError as error:
             raise ValueError("Pillow is required for the configured caption highlighter.") from error
         try:
-            pil_font = ImageFont.truetype(str(font_abs), font_size)
+            pil_font = ImageFont.truetype(str(font_abs) if font_abs else "DejaVuSans-Bold.ttf", font_size)
         except OSError as error:
-            raise ValueError(f"Cannot load the configured caption highlighter font: {font_abs.name}") from error
-        win_ratio = _ttf_win_ratio(font_abs)
+            raise ValueError(f"Cannot load the configured caption highlighter font: {font_abs.name if font_abs else font}") from error
+        if font_abs:
+            win_ratio = _ttf_win_ratio(font_abs)
 
     srt, ass = [], []
     sanitize = str.maketrans({"{": "(", "}": ")", "\\": "／"})
@@ -464,7 +498,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         for w in group:
             cand = cur + [w]
             cand_w = pil_font.getlength(" ".join(x["text"] for x in cand)) * win_ratio
-            if cur and cand_w > 760:
+            if cur and cand_w > (730 if mobile else 760):
                 chunks.append(cur)
                 cur = [w]
             else:

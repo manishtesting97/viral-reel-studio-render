@@ -149,8 +149,15 @@ COMMON_CSS = """/* Auto-generated universal editorial scene stylesheet inheritin
   gap: var(--vrs-visual-gap);
 }
 .vrs-artwork-layout {
-  bottom: max(550px, var(--vrs-caption-clearance, 550px));
+  bottom: max(var(--vrs-artwork-bottom, 550px), var(--vrs-caption-clearance, 550px));
   gap: min(64px, var(--vrs-visual-gap));
+}
+.vrs-mobile-artwork {scale:var(--vrs-artwork-scale,1)}
+#stage[data-mobile-template] .vrs-auto-layout {
+  --vrs-profile-gap:42px;
+  --vrs-visual-gap:28px;
+  right:104px;
+  bottom:max(var(--vrs-artwork-bottom), var(--vrs-caption-clearance));
 }
 .vrs-procedural-model {position:relative; width:100%; min-height:0; flex:1}
 .vrs-procedural-model canvas {position:absolute; inset:0; width:100%; height:100%; object-fit:contain}
@@ -165,9 +172,10 @@ COMMON_CSS = """/* Auto-generated universal editorial scene stylesheet inheritin
   font-weight: 700;
   line-height: 1.08;
   letter-spacing: -0.025em;
-  text-align: center;
+  text-align: var(--vrs-heading-align, center);
   color: var(--vrs-heading-color, var(--brand-ink, #181412));
 }
+#stage[data-mobile-template] .vrs-auto-heading {text-wrap:balance;overflow-wrap:anywhere}
 .vrs-auto-heading em {
   font-family: var(--vrs-serif-font, "Noto Serif", Georgia, serif);
   font-style: italic;
@@ -1251,15 +1259,15 @@ def _common_js_setup(sid: str, beats: list[dict], extra_js: str = "", storyboard
 """
 
 
-def _procedural_script(sid, model, events):
-    spec = json.dumps({"id": sid, **model, "events": events})
+def _procedural_script(sid, model, events, scale=None):
+    spec = json.dumps({"id": sid, **model, "events": events, "framingScale": scale})
     return "  const model = " + spec + ";\n" + r"""
   window.__hf = window.__hf || {};
   window.__hf.buildReady = window.__hf.buildReady || {};
   window.__hf.buildReady[model.id] = (async () => {
     const mount = root.querySelector(".vrs-procedural-model");
     const T = await import(new URL("assets/three.module.min.js", document.baseURI).href);
-    const width = 944, height = 760;
+    let width = 944, height = 760;
     const world = new T.Scene();
     const camera = new T.PerspectiveCamera(model.fov || 38, width / height, 0.1, 100);
     const renderer = new T.WebGLRenderer({alpha:true, antialias:true, powerPreference:"low-power"});
@@ -1372,6 +1380,7 @@ def _procedural_script(sid, model, events):
       mesh.castShadow = opacity===1;
       mesh.receiveShadow = true;
       (part.fixed ? world : assembly).add(mesh);
+      if (model.framingScale !== null) geometry.computeBoundingBox();
       parts.set(part.id,mesh);
       const visibilityCue = model.events.find(event=>
         event.target===part.id && (event.action==="reveal" || event.action==="hide"));
@@ -1422,6 +1431,30 @@ def _procedural_script(sid, model, events):
         }
       }
       camera.lookAt(look);
+      if (model.framingScale !== null) {
+        const nextWidth = mount.clientWidth;
+        const nextHeight = Math.min(1024, mount.clientHeight);
+        if (nextWidth > 0 && nextHeight > 0 && (nextWidth !== width || nextHeight !== height)) {
+          width = nextWidth;
+          height = nextHeight;
+          camera.aspect = width / height;
+          renderer.setSize(width, height, false);
+        }
+        camera.zoom = 1;
+        camera.updateProjectionMatrix();
+        camera.updateMatrixWorld();
+        world.updateMatrixWorld(true);
+        let edge = 0;
+        for (const mesh of parts.values()) {
+          const {min, max} = mesh.geometry.boundingBox;
+          for (const x of [min.x,max.x]) for (const y of [min.y,max.y]) for (const z of [min.z,max.z]) {
+            projection.set(x,y,z).applyMatrix4(mesh.matrixWorld).project(camera);
+            edge = Math.max(edge, Math.abs(projection.x), Math.abs(projection.y));
+          }
+        }
+        camera.zoom = Math.max(.65, Math.min(model.framingScale, .88 / Math.max(edge, .01)));
+        camera.updateProjectionMatrix();
+      }
       renderer.render(world,camera);
       const scale = Math.min(mount.clientWidth / width, mount.clientHeight / height);
       for (const {element,position} of labels) {
@@ -1858,7 +1891,9 @@ def _render_component_html_and_js(
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", secondary):
         secondary = "#4350d8"
 
-    heading_html = f'<h1 class="vrs-auto-heading">{_format_heading_html(heading)}</h1>'
+    mobile = style.get("mobile")
+    title = escape(heading.strip()) if mobile else _format_heading_html(heading)
+    heading_html = f'<h1 class="vrs-auto-heading">{title}</h1>'
     cursor_svg = (
         f'<svg class="vrs-cursor-ptr" id="cur-{escape(sid)}" viewBox="0 0 36 36">'
         '<path d="M4 3 L14 31 L18 20 L29 17 Z" fill="#181412" stroke="#ffffff" stroke-width="2.5" stroke-linejoin="round"/></svg>'
@@ -1872,12 +1907,14 @@ def _render_component_html_and_js(
         body = ('<div class="vrs-auto-stage" style="height:auto;flex:1;align-items:center;justify-content:center">'
                 '<div class="vrs-procedural-model">'
                 '</div></div>')
-        extra_js = _procedural_script(sid, model, events)
+        extra_js = _procedural_script(sid, model, events, (mobile or {}).get("scale3d"))
         # The WebGL listener drives model motion from the same seek time as the GSAP timeline.
         storyboard["events"] = []
         storyboard["model"] = model
     elif component == "semantic-artwork":
         body = _artwork_markup(storyboard)
+        if mobile:
+            body = body.replace('class="vrs-semantic-artwork"', 'class="vrs-semantic-artwork vrs-mobile-artwork"', 1)
     elif component == "comparison_split":
         entities = [str(e).strip() for e in (storyboard.get("entities") or []) if str(e).strip()]
         lbl_left, lbl_right = _pick_summary_labels(f"{heading}. {desc}")
