@@ -18,6 +18,7 @@ SIDE = "scene-assets.json"
 MODES = ("ai", "image", "video", "hybrid")
 MAX_LAYERS = 12
 FORMATS = {
+    "glb": ("model", None, None),
     "png": ("image", "png_pipe", "png"), "jpg": ("image", "jpeg_pipe", "mjpeg"),
     "webp": ("image", "webp_pipe", "webp"), "svg": ("image", "svg_pipe", "svg"),
     "mp4": ("video", "mp4", None), "mov": ("video", "mov", None),
@@ -91,6 +92,8 @@ def original(asset):
 
 
 def public(asset):
+    if asset["kind"] == "model":
+        return {**asset, "url": None, "thumbnail": None}
     return {**asset, "url": f'/asset-media/{asset["id"]}/preview',
             "thumbnail": f'/asset-media/{asset["id"]}/thumb' if asset["kind"] != "audio" else None}
 
@@ -102,6 +105,8 @@ def visible(asset, project, plan):
 
 def media(asset_id, variant):
     asset = record(asset_id, catalog())
+    if asset["kind"] == "model":
+        raise ValueError("3D models are previewed in production scenes.")
     suffix = {"image": "png", "video": "mp4", "audio": "mp3"}[asset["kind"]]
     if variant == "preview":
         path = blob(asset) / f"preview.{suffix}"
@@ -161,7 +166,102 @@ def input_options(ext):
     return ("-protocol_whitelist", "file", "-f", demuxer)
 
 
+def inspect_glb(source):
+    import struct
+
+    size = source.stat().st_size
+    if not 20 <= size <= 24 * 1024**2:
+        raise ValueError("Use a self-contained GLB no larger than 24 MiB.")
+    try:
+        with source.open("rb") as stream:
+            magic, version, total, length, kind = struct.unpack("<4sIII4s", stream.read(20))
+            if (magic, version, total, kind) != (b"glTF", 2, size, b"JSON") or not 0 < length <= min(size - 28, 2**20):
+                raise ValueError("Invalid GLB 2.0 header.")
+            gltf = json.loads(stream.read(length))
+            binary, kind = struct.unpack("<I4s", stream.read(8))
+            if kind != b"BIN\x00" or binary + length + 28 != size:
+                raise ValueError("GLB must contain one embedded binary chunk.")
+        buffers = gltf["buffers"]
+        if len(buffers) != 1 or "uri" in buffers[0] or not 0 < buffers[0]["byteLength"] <= binary:
+            raise ValueError("GLB buffers must be embedded.")
+        for image in gltf.get("images", []):
+            if "uri" in image or "bufferView" not in image or image.get("mimeType") not in {"image/png", "image/jpeg"}:
+                raise ValueError("GLB textures must be embedded PNG or JPEG images.")
+        # Restrict allocation and draw calls before the browser parses the model.
+        nodes, meshes = gltf["nodes"], gltf["meshes"]
+        accessors = gltf["accessors"]
+        if (not 0 < len(nodes) <= 128 or not 0 < len(meshes) <= 64 or len(accessors) > 512
+                or len(gltf.get("images", [])) > 8
+                or gltf.get("extensionsRequired")
+                or any("extensions" in item for item in [*nodes, *meshes, *gltf.get("textures", [])])
+                or sum(a["count"] for a in accessors) > 900_000
+                or any(type(a["count"]) is not int or a["count"] <= 0 for a in accessors)
+                or sum(len(m["primitives"]) for m in meshes) > 96):
+            raise ValueError("GLB exceeds the supported complexity or needs an unsupported decoder.")
+        views = gltf["bufferViews"]
+        for view in views:
+            offset, count = view.get("byteOffset", 0), view["byteLength"]
+            if "extensions" in view or view["buffer"] != 0 or not 0 <= offset < offset + count <= buffers[0]["byteLength"]:
+                raise ValueError("Invalid GLB buffer view.")
+        for i, node in enumerate(nodes):
+            children = node.get("children", [])
+            if any(type(child) is not int or not 0 <= child < len(nodes) for child in children):
+                raise ValueError(f"Invalid children for GLB node {i}.")
+        parents = [child for node in nodes for child in node.get("children", [])]
+        if len(set(parents)) != len(parents):
+            raise ValueError("GLB nodes may have only one parent.")
+        visiting, visited = set(), set()
+
+        def visit(i):
+            if i in visiting:
+                raise ValueError("GLB node hierarchy contains a cycle.")
+            if i in visited:
+                return
+            visiting.add(i)
+            for child in nodes[i].get("children", []):
+                visit(child)
+            visiting.remove(i)
+            visited.add(i)
+
+        for i in range(len(nodes)):
+            visit(i)
+        with source.open("rb") as stream:
+            for image in gltf.get("images", []):
+                index = image["bufferView"]
+                if type(index) is not int or not 0 <= index < len(views):
+                    raise ValueError("Invalid GLB image buffer view.")
+                view = views[index]
+                stream.seek(28 + length + view.get("byteOffset", 0))
+                image_data = stream.read(view["byteLength"])
+                ext = "png" if image["mimeType"] == "image/png" else "jpg"
+                result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-protocol_whitelist", "pipe", "-f", FORMATS[ext][1],
+                     "-show_entries", "stream=width,height", "-of", "json", "-i", "pipe:0"],
+                    input=image_data, capture_output=True, check=False, timeout=10)
+                images = json.loads(result.stdout or "{}").get("streams", [])
+                if result.returncode or len(images) != 1 or not (
+                        0 < images[0]["width"] <= 2048 and 0 < images[0]["height"] <= 2048):
+                    raise ValueError("GLB textures must decode and fit within 2048 × 2048 pixels.")
+    except (KeyError, TypeError, AttributeError, struct.error, RecursionError, subprocess.TimeoutExpired) as error:
+        raise ValueError("Malformed GLB model.") from error
+    return {"kind": "model"}
+
+
+def model_source(project, plan, asset_id):
+    asset = record(asset_id, catalog())
+    if asset["kind"] != "model" or not visible(asset, project, plan):
+        raise ValueError(f"Model asset {asset_id} is unavailable to this project.")
+    path = original(asset)
+    if path.is_symlink() or not path.resolve().is_relative_to(LIBRARY.resolve()) or not path.is_file():
+        raise ValueError(f"Model asset {asset_id} is missing or invalid.")
+    if hash_file(path) != asset["sha256"]:
+        raise ValueError(f"Model asset {asset_id} failed its integrity check.")
+    return path
+
+
 def inspect(source, ext):
+    if ext == "glb":
+        return inspect_glb(source)
     kind, container, codec = FORMATS[ext]
     if ext == "svg":
         svg_safe(source)
@@ -242,7 +342,8 @@ def upload(stream, length, maximum, filename, scope, owner):
                  "description": "", "format": ext, "bytes": length, "sha256": sha, **meta}
         target = blob(asset)
         if not target.exists():
-            previews(source, temp, meta)
+            if meta["kind"] != "model":
+                previews(source, temp, meta)
             target.parent.mkdir(exist_ok=True)
             temp.rename(target)
         else:
@@ -320,7 +421,7 @@ def assignment(value, assets, duration):
             raise ValueError("Each media layer must be a JSON object.")
         asset = record(layer.get("asset"), assets)
         kind = asset["kind"]
-        if kind == "audio" or mode in {"image", "video"} and kind != mode:
+        if kind in {"audio", "model"} or mode in {"image", "video"} and kind != mode:
             raise ValueError("The selected asset type does not match the scene mode.")
         start = number(layer, "start", 0, 0, duration)
         end = number(layer, "end", duration, start, duration)

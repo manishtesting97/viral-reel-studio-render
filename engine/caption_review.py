@@ -192,7 +192,14 @@ def caption_state(project, plan, timeline, report, mutation=None):
                 edits[str(i)] = v
     else:
         edits = {}
-    revision = digest(base, edits, windows)
+    skips = {
+        str(i): {"scene": script[i][0], "text": script[i][1]}
+        for i in missing.keys() - words.keys() - opening_reviews
+        if state.get("timingKey") == report.get("timingKey")
+        and state.get("skips", {}).get(str(i)) == {"scene": script[i][0], "text": script[i][1]}
+        and str(i) not in edits
+    }
+    revision = digest(base, edits, windows, skips)
     original_words = words.copy()
 
     def apply(i, start, end):
@@ -212,7 +219,25 @@ def caption_state(project, plan, timeline, report, mutation=None):
         if mutation.get("revision") != revision:
             raise ValueError("Caption review changed. Reload this step before saving.")
         action = mutation.get("action")
-        if action == "bulk_accept":
+        if action in {"skip", "skip_remaining"}:
+            if mutation.get("accepted") is not True:
+                raise ValueError("Confirm that the selected caption words should be skipped.")
+            available = missing.keys() - words.keys() - opening_reviews - {int(i) for i in edits}
+            available -= {int(i) for i in skips}
+            if action == "skip":
+                index = mutation.get("index")
+                if type(index) is not int or index not in available:
+                    raise ValueError("Only unresolved missing words can be skipped. Scene openings require verified timing.")
+                available = {index}
+            if not available:
+                raise ValueError("There are no missing caption words eligible to skip.")
+            for i in available:
+                skips[str(i)] = {"scene": script[i][0], "text": script[i][1]}
+        elif action == "restore_skip":
+            index = mutation.get("index")
+            if type(index) is not int or skips.pop(str(index), None) is None:
+                raise ValueError("There is no skipped caption word to restore.")
+        elif action == "bulk_accept":
             if mutation.get("accepted") is not True:
                 raise ValueError("Listen and confirm before bulk-accepting measured timing suggestions.")
             items = mutation.get("items")
@@ -267,10 +292,10 @@ def caption_state(project, plan, timeline, report, mutation=None):
                 words[i] = original
             apply(i, values["start"],values["end"])
     if mutation is not None:
-        save(path, {"base": base, "timingKey": report.get("timingKey"), "edits": edits})
-        revision = digest(base,edits,windows)
+        save(path, {"base": base, "timingKey": report.get("timingKey"), "edits": edits, "skips": skips})
+        revision = digest(base, edits, windows, skips)
 
-    unresolved = [{**item,"scriptIndex":i} for i,item in missing.items() if i not in words]
+    unresolved = [{**item,"scriptIndex":i} for i,item in missing.items() if i not in words and str(i) not in skips]
     reviewed = [{**item,"scriptIndex":i} for i,item in review.items() if str(i) not in edits]
     ordered = [w for _,w in sorted(words.items())]
     remaining_openings = sorted(opening_reviews - {int(i) for i in edits})
@@ -290,7 +315,27 @@ def caption_state(project, plan, timeline, report, mutation=None):
         | {item["scriptIndex"] for item in unresolved if _is_valid_suggestion(item["scriptIndex"], item.get("candidate"))}
     )
     missing_ids = sorted({item["scriptIndex"] for item in unresolved} - set(suggested_ids))
-    verified_count = sum(1 for i, w in words.items() if str(i) in edits or i not in review)
+    verified_count = sum(w["scriptWords"] for i, w in words.items() if str(i) in edits or i not in review)
+    anchor_issues = []
+    if skips:
+        from motion_choreography import resolve_anchor_time
+
+        skipped_scenes = {entry["scene"] for entry in skips.values()}
+        for scene in plan["scenes"]:
+            if scene["id"] not in skipped_scenes:
+                continue
+            storyboard = scene.get("storyboard") or {}
+            scene_words = [word for word in ordered if word["scene"] == scene["id"]]
+            for kind in ("model", "artwork"):
+                for event in (storyboard.get(kind) or {}).get("events", []):
+                    anchor = event.get("anchor")
+                    if anchor and (not scene_words or resolve_anchor_time(
+                            anchor, scene_words, scene["narration"], 0, timeline["voiceDuration"],
+                            exact=True, occurrence=event.get("occurrence", 1)) is None):
+                        anchor_issues.append(f'{scene["id"]}: {event["action"]} cue {anchor!r} has no verified onset. '
+                                             'Restore the skipped word for timing or review the scene cue.')
+    pending_indices = (required - {int(i) for i in edits}) | {row["scriptIndex"] for row in unresolved}
+
     effective = {**report, "unmatched":unresolved, "reviewWords":reviewed, "matches":ordered,
                  "coverage":sum(w["scriptWords"] for w in ordered)/len(script),
                  "captionRevision":revision, "automaticRecovery":list(automatic.values()),
@@ -299,14 +344,21 @@ def caption_state(project, plan, timeline, report, mutation=None):
                  "suggestedIndices": suggested_ids,
                  "missingIndices": missing_ids,
                  "verifiedCount": verified_count,
-                 "premiumCaptionReady":not unresolved and not remaining_openings}
+                 "skippedWords": [{"scriptIndex": int(i), **entry} for i, entry in sorted(skips.items(), key=lambda row: int(row[0]))],
+                 "skippableIndices": [row["scriptIndex"] for row in unresolved if row["scriptIndex"] not in opening_reviews],
+                 "remainingCount": len(pending_indices | set(remaining_openings)),
+                 "anchorIssues": anchor_issues,
+                 "premiumCaptionReady": not unresolved and not remaining_openings and not anchor_issues}
+    if anchor_issues:
+        effective["failureReason"] = anchor_issues[0]
     # Keep the established ASR strong-evidence metric and gate independent of manual review.
     if failed:
-        pending = sorted((required - {int(i) for i in edits}) | {row["scriptIndex"] for row in unresolved})
+        pending = sorted(pending_indices | set(remaining_openings))
         supported = sum(w["scriptWords"] for w in ordered if w["match"] == "manual"
                         or (w["match"] != "approximate" and w.get("probability", 0) >= MIN_ANCHOR_CONFIDENCE))
         evidence = supported / max(len(script), report.get("recognizedWords", 0), 1)
-        reason = (f"{len(pending)} entries still need verified timing." if pending else
+        reason = (anchor_issues[0] if anchor_issues else
+                  f"{len(pending)} entries still need verified timing." if pending else
                   f"Verified script evidence is {evidence:.1%}, below the {QUALITY_FLOOR:.0%} gate. "
                   "Check for extra speech or a recording that differs from the script."
                   if evidence < QUALITY_FLOOR else None)

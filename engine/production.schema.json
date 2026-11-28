@@ -32,10 +32,13 @@
                   "sphere",
                   "cylinder",
                   "torus",
+                  "rounded-box",
+                  "glb",
                   "loft",
                   "tube"
                 ]
               },
+              "asset": {"type": "string", "minLength": 32, "maxLength": 32, "pattern": "^[a-f0-9]{32}$"},
               "size": {
                 "type": "array",
                 "items": {
