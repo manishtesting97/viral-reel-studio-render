@@ -110,7 +110,9 @@ def profile_markup(brand, photo, last_scene, duration, *, mobile=False):
     header = (f'<aside id="profile-header">{img}<div><strong>{name}</strong>'
               f'<small>{text["profileTitle"]}</small></div></aside>')
     if mobile and handle:
-        header = f'<aside id="profile-header" class="mobile-profile">{img}<strong>{handle}</strong></aside>'
+        title = f'<small>{text["profileTitle"]}</small>' if text["profileTitle"] else ""
+        header = (f'<aside id="profile-header" class="mobile-profile">{img}'
+                  f'<div><strong>{handle}</strong>{title}</div></aside>')
     if last_scene["id"] not in {"outro", "brand-outro"}:
         return header, ""
     start = last_scene["start"]
@@ -233,6 +235,9 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
                 g = mobile["gradient"]
                 background = f"linear-gradient({g['angle']}deg,{g['start']},{g['end']})"
             variables += f";--vrs-template-background:{background}"
+        username_font = brand.get("fonts", {}).get("english", {}).get("family")
+        if username_font:
+            variables += f';--vrs-username-font:"{username_font}",var(--brand-font,sans-serif)'
         username = mobile.get("username", {})
         variables += f";--vrs-username-size:{username.get('size', 28)}px;--vrs-username-color:{username.get('color', '#181412')}"
         variables += f";--vrs-heading-align:{mobile.get('heading', {}).get('alignment', 'center')}"
@@ -279,9 +284,11 @@ body {{margin:0}}
 #profile-header img {{width:var(--vrs-header-size,64px);height:var(--vrs-header-size,64px);border-radius:50%;object-fit:cover}}
 #profile-header strong,#profile-header small {{display:block;font-size:29px;line-height:1.1}}
 #profile-header small {{font-size:19px;color:#484036}}
-#profile-header.mobile-profile {{padding:7px 16px 7px 7px;gap:10px}}
+#profile-header.mobile-profile {{padding:7px 16px 7px 7px;gap:10px;
+  font-family:var(--vrs-username-font,var(--brand-font,sans-serif))}}
 #profile-header.mobile-profile img {{width:44px;height:44px}}
-#profile-header.mobile-profile strong {{font-size:var(--vrs-username-size);color:var(--vrs-username-color)}}
+#profile-header.mobile-profile strong {{font-size:var(--vrs-username-size);color:var(--vrs-username-color);font-weight:700}}
+#profile-header.mobile-profile small {{margin-top:2px;font-size:18px;font-weight:400;line-height:1.12}}
 #profile-outro {{top:470px;left:158px;right:158px;display:flex;flex-direction:column;align-items:center;
   gap:9px;text-align:center;font-size:31px;line-height:1.2}}
 #profile-outro .portrait {{padding:10px;border-radius:50%;background:conic-gradient(var(--brand-highlight,#ffd400),#fff1a6,var(--brand-highlight,#ffd400));
