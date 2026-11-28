@@ -227,6 +227,12 @@ def stage(project, plan, timing, source, preset, *, asset_project=None):
     visual = {**style.get("layout", {}), **brand.get("layout", {}), **mobile.get("heading", {})}
     if mobile:
         variables += f";--style-ground:{mobile['background']};--vrs-artwork-bottom:420px"
+        if "backgroundMode" in mobile:
+            background = mobile["background"]
+            if mobile["backgroundMode"] == "gradient":
+                g = mobile["gradient"]
+                background = f"linear-gradient({g['angle']}deg,{g['start']},{g['end']})"
+            variables += f";--vrs-template-background:{background}"
         username = mobile.get("username", {})
         variables += f";--vrs-username-size:{username.get('size', 28)}px;--vrs-username-color:{username.get('color', '#181412')}"
         variables += f";--vrs-heading-align:{mobile.get('heading', {}).get('alignment', 'center')}"
@@ -259,8 +265,13 @@ body {{margin:0}}
 #production {{position:relative;overflow:hidden;width:{width}px;height:{height}px}}
 #stage {{position:absolute;inset:0;width:1080px;height:1920px;
   transform:scale({width / 1080});transform-origin:top left;{variables}}}
-.scene {{position:absolute;inset:0;overflow:hidden;background:var(--style-ground,#faf5f0);
+.scene {{position:absolute;inset:0;overflow:hidden;background:var(--vrs-template-background,var(--style-ground,#faf5f0));
   color:var(--brand-ink,#181412);font-family:var(--brand-font,sans-serif)}}
+#stage[data-template-background] .vrs-auto-scene {{background:transparent}}
+#stage[data-template-background] .vrs-auto-bg {{
+  background-image:radial-gradient(var(--style-grid-dot,transparent) 1.5px,transparent 1.5px);
+  background-size:28px 28px;opacity:.32
+}}
 #profile-header,#profile-outro {{position:absolute;color:var(--brand-ink,#181412);
   font-family:var(--brand-font,sans-serif);z-index:10;pointer-events:none}}
 #profile-header {{top:var(--vrs-header-top,283px);left:var(--vrs-header-left,89px);display:flex;align-items:center;gap:18px;
@@ -285,7 +296,7 @@ body {{margin:0}}
 </style>
 <main id="production" data-composition-id="production" data-start="0"
  data-duration="{render_duration:.9f}" data-width="{width}" data-height="{height}">
-<div id="stage" {"data-mobile-template" if mobile else ""}>{''.join(layers)}{''.join(asset_layers)}{overlay}{disclosures}</div></main>
+<div id="stage" {"data-mobile-template" if mobile else ""} {"data-template-background" if "backgroundMode" in mobile else ""}>{''.join(layers)}{''.join(asset_layers)}{overlay}{disclosures}</div></main>
 {''.join(scripts)}
 <script>
 if (document.getElementById("stage").style.getPropertyValue("--vrs-artwork-bottom")) {{
@@ -468,7 +479,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         scene["caption_style"] == "word" for scene in plan["scenes"]
     )):
         font_rel = font_cfg.get("bold") or font_cfg.get("regular")
-        if not font_rel and use_highlighter:
+        if not font_rel and use_highlighter and not mobile:
             raise ValueError("The caption highlighter requires a configured font file.")
         font_abs = (BRAND_DIR / font_rel).resolve() if font_rel else None
         try:
@@ -510,7 +521,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     for scene in plan["scenes"]:
         selected = [word for word in words if word["scene"] == scene["id"]]
         gap = style.get("captions", {}).get("maxPauseGapSec", 0.22)
-        style_name = "DarkScene" if (scene["id"] in dark_scenes and use_highlighter) else "Default"
+        style_name = "DarkScene" if (not mobile and scene["id"] in dark_scenes and use_highlighter) else "Default"
         groups = []
         for g in group_captions(selected, max_words=words_per_group, max_gap=gap):
             groups.extend(split_width(g))
@@ -521,7 +532,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 labels = [word["text"].translate(sanitize) for word in group]
                 full_line = " ".join(labels)
                 full_w = (pil_font.getlength(full_line) * win_ratio) if pil_font else 0
-                pill_h = round(font_size * 0.78)
+                pill_h = round(font_size * (0.9 if mobile else 0.78))
                 pill_y = round(1920 - margin_v - font_size * 0.59 - pill_h / 2)
                 for index, word in enumerate(group):
                     if use_highlighter and pil_font:
@@ -532,10 +543,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         cue(word["start"], word["end"],
                             f"{{\\pos({round(px)},{pill_y})\\p1}}{_pill_ass_path(pw, pill_h, 14)}{{\\p0}}",
                             layer=0, style_name="Pill")
-                        if adaptive or style_name == "DarkScene":
+                        if mobile or adaptive or style_name == "DarkScene":
                             colored = labels.copy()
-                            active = r"{\1c&H121418&\bord0\shad0}" if adaptive else r"{\1c&H121418&}"
-                            reset = r"{\r}" if adaptive else r"{\1c}"
+                            active = r"{\1c&H121418&\bord0\shad0}" if mobile or adaptive else r"{\1c&H121418&}"
+                            reset = r"{\r}" if mobile or adaptive else r"{\1c}"
                             colored[index] = active + labels[index] + reset
                             cue(word["start"], word["end"], " ".join(colored), layer=1, style_name=style_name)
                         else:

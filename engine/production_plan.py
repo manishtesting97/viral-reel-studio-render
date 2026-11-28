@@ -138,7 +138,7 @@ MOBILE_STYLE = {
     "heading": {"headingSize": 80, "headingColor": "#181412", "alignment": "center"},
     "captions": {"size": 90, "marginBottom": 340, "wordsPerGroup": 4,
                  "highlight": "#FFD400", "textColor": "#FFFFFF", "box": False,
-                 "highlighter": False, "autoContrast": False, "outline": 5, "shadow": 3},
+                 "highlighter": True, "autoContrast": False, "outline": 3, "shadow": 2},
     "username": {"size": 28, "color": "#181412"},
     "scale2d": 1.0,
     "scale3d": 1.28,
@@ -168,7 +168,21 @@ def validate_template(value):
         elif item not in ("left", "center", "right"):
             raise ValueError(f"Invalid {key}.")
 
-    check(value, MOBILE_STYLE, "visual settings")
+    if not isinstance(value, dict):
+        raise ValueError("Invalid template visual settings.")
+    optional = {"backgroundMode", "gradient"}
+    check({key: item for key, item in value.items() if key not in optional},
+          MOBILE_STYLE, "visual settings")
+    if value.get("backgroundMode", "solid") not in ("solid", "gradient"):
+        raise ValueError("Background mode must be solid or gradient.")
+    if "gradient" in value or value.get("backgroundMode") == "gradient":
+        gradient = value.get("gradient")
+        if not isinstance(gradient, dict) or gradient.keys() != {"start", "end", "angle"}:
+            raise ValueError("Gradient requires start and end colors and an angle.")
+        for key in ("start", "end"):
+            check(gradient[key], "#000000", key)
+        if type(gradient["angle"]) is not int or not 0 <= gradient["angle"] <= 360:
+            raise ValueError("Gradient angle must be an integer from 0 to 360.")
     if value["captions"]["size"] < 54 or value["username"]["size"] > 40:
         raise ValueError("Caption size must be at least 54 px and username size at most 40 px.")
     return value
@@ -309,7 +323,7 @@ def production_prompt(project, config, badge=None):
           "never put direction tags in spoken narration or captions, and ensure beforeWord indices and phrase-based animation anchors "
           "match the final spoken wording. "
           "\n\nVisual planning: specify original scene-specific visuals. Use referenceStyle as the authoritative art direction and "
-          "apply the selected style across niches. Isometric Tech Grid favors detailed perspective objects, mechanisms, "
+          "use its resolved background and typography across niches. Isometric Tech Grid favors detailed perspective objects, mechanisms, "
           "architecture and network flows. Warm Editorial Motion favors expressive pacing, dynamic typography and relatable "
           "illustrations. Warm Editorial Explainer favors clear diagrams, comparisons and step-by-step demonstrations. Use "
           "the brand profile as identity. Use short topic-specific headings (prefer two to four words, up to six), a strong opening hook, and large explanatory visuals clear of captions and branding. Asset entries are local relative filenames, never URLs. "
