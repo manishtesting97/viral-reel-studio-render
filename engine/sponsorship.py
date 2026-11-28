@@ -149,30 +149,55 @@ def prompt_context(project, plan):
                       "for media assignments, not paths in the approved scene code. Include a sponsor CTA only as configured.")}
 
 
+# Composition pixels. Reserve the full card lane, including wrapped CTA text.
+CARD_BOTTOM = 340
+CAPTION_MARGIN = CARD_BOTTOM + 166 + 26
+
+
+def scene_scope(config, sid, *, last):
+    mode = config["mode"]
+    if mode == "normal":
+        return False, False
+    return mode == "full" or sid in config["scenes"], last and config.get("endCTA", False)
+
+
 CSS = """
-.vrs-disclosure {position:absolute;z-index:40;top:var(--vrs-disclosure-top,330px);left:88px;max-width:840px;
- display:flex;align-items:center;gap:12px;background:#fff;color:#171717;border:2px solid #171717;
- border-left:9px solid var(--sponsor-accent);border-bottom:4px solid var(--sponsor-secondary);
- border-radius:12px;padding:8px 14px;font:600 30px/1.16 var(--brand-font,sans-serif);overflow-wrap:anywhere}
-.vrs-disclosure .vrs-badge-tag {flex:none;background:#161616;color:#fff;padding:5px 10px;border-radius:5px;font-weight:800}
-.vrs-disclosure img {flex:none;width:58px;height:49px;object-fit:contain}
-.vrs-disclosure small {display:block;color:#171717;font-size:25px}
+.vrs-sponsor-badge {position:absolute;z-index:40;top:calc(var(--vrs-header-top,283px) + 6px);
+ right:var(--vrs-header-left,68px);display:flex;align-items:center;min-height:44px;
+ padding:4px 20px;border:1px solid #ffffffad;border-radius:999px;background:#242333;
+ color:#fff;box-shadow:0 6px 18px #18141224;font:800 22px/1 var(--brand-font,sans-serif);
+ letter-spacing:.065em;pointer-events:none}
+.vrs-disclosure {position:absolute;z-index:40;bottom:var(--vrs-sponsor-bottom);
+ left:50%;translate:-50% 0;width:max-content;max-width:760px;box-sizing:border-box;
+ display:flex;align-items:center;gap:14px;padding:10px 22px;
+ background:#fffdf9;color:#181412;border:1px solid #d8d4d0;
+ border-inline-start:4px solid var(--sponsor-accent);border-bottom-color:var(--sponsor-secondary);
+ border-radius:19px;box-shadow:0 7px 20px #1814121c;
+ font:700 27px/1.12 var(--brand-font,sans-serif);overflow-wrap:anywhere;pointer-events:none}
+.vrs-disclosure img {flex:none;width:52px;height:48px;object-fit:contain}
+.vrs-disclosure small {display:block;color:#47434b;font-size:20px;line-height:1.16;font-weight:500}
+.vrs-disclosure .vrs-sponsored-by {font-size:17px;margin-bottom:3px}
+.vrs-disclosure strong {display:block}
+.vrs-disclosure strong + small {margin-top:3px}
+#stage .vrs-sponsored-scene .vrs-auto-layout {
+ bottom:max(var(--vrs-artwork-bottom,550px),var(--vrs-caption-clearance));
+}
 """
 
 
-def panels(target, config, used, timing, duration, header_bottom):
+def panels(target, config, used, timing, duration):
     if not used:
-        return ""
+        return "", ""
     assets = {}
     for profile in used.values():
         assets.update(profile_assets(profile))
     logo_dir = target / "assets" / "sponsor-media"
     overlays = []
+    motion = []
     for index, scene in enumerate(timing["scenes"]):
         row = config["scenes"].get(scene["id"], {})
         last = index == len(timing["scenes"]) - 1
-        sponsored = config["mode"] == "full" or scene["id"] in config["scenes"]
-        end_cta = last and config["endCTA"]
+        sponsored, end_cta = scene_scope(config, scene["id"], last=last)
         if not sponsored and not end_cta:
             continue
         profile = used[row.get("sponsor") or config["sponsor"]]
@@ -198,15 +223,24 @@ def panels(target, config, used, timing, duration, header_bottom):
         if end_cta and not row.get("cta"):
             segments = ([(start, tail, "")] if sponsored and tail > start else []) + [(tail, end, detail)]
         badge = "AD" if config["disclosure"] == "ad" else "SPONSOR"
+        badge_start = start if sponsored else tail
+        badges = f'#{scene["id"]} :is(.vrs-meta-badge,.k8s-chapter)'
+        motion.append(f'tl.set("{badges}",{{visibility:"hidden"}},{badge_start});')
+        overlays.append(
+            f'<aside class="clip vrs-sponsor-badge" id="vrs-sponsor-badge-{index}" data-start="{badge_start:.9f}" '
+            f'data-duration="{end-badge_start:.9f}" data-track-index="501">{badge}</aside>')
         for j, (a, b, message) in enumerate(segments):
+            card = f"vrs-disclosure-{index}-{j}"
+            motion.append(f'tl.fromTo("#{card}",{{opacity:.65,y:4}},'
+                          f'{{opacity:1,y:0,duration:{min(.24,(b-a)/3):.6f},ease:"power2.out",immediateRender:false}},{a});')
             notes = f"<small>{message}</small>" if message else ""
             overlays.append(
-                f'<aside id="vrs-disclosure-{index}-{j}" class="clip vrs-disclosure" data-start="{a:.9f}" '
+                f'<aside id="{card}" class="clip vrs-disclosure" data-start="{a:.9f}" '
                 f'data-duration="{b-a:.9f}" data-track-index="500" '
                 f'style="--sponsor-accent:{profile["accent"]};--sponsor-secondary:{profile["secondary"]};'
-                f'--vrs-disclosure-top:{header_bottom}px"><span class="vrs-badge-tag">{badge}</span>'
-                f'{logo}<div>{escape(profile["name"])}{notes}</div></aside>')
-    return "".join(overlays)
+                f'--vrs-sponsor-bottom:{CARD_BOTTOM}px">{logo}<div><small class="vrs-sponsored-by">Sponsored by</small>'
+                f'<strong>{escape(profile["name"])}</strong>{notes}</div></aside>')
+    return "".join(overlays), "".join(motion)
 
 
 def render_context(project, plan, *, verify=False, assignments=None):
