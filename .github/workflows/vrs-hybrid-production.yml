@@ -106,82 +106,19 @@ jobs:
         run: |
           umask 077
           python3 engine/github_production.py metadata "$VRS_JOB" "$REQUEST" >> "$GITHUB_OUTPUT"
-      - name: 02 · Prepare pinned Whisper and optional Apex and stable-ts runtime
-        if: ${{ steps.metadata.outputs.operation == 'transcribe' }}
-        env:
-          RECOVERY: ${{ steps.metadata.outputs.recovery }}
+      - name: 02 · Prepare pinned Faster Whisper runtime
+        if: ${{ steps.metadata.outputs.operation == 'transcribe' || steps.metadata.outputs.operation == 'produce' }}
         run: |
           umask 077
           models="$RUNNER_TEMP/vrs-models"
           mkdir -p "$models"
-          python3 - "$models" <<'EOF'
-          import json
-          import os
-          import shutil
-          import subprocess
-          import sys
-          from pathlib import Path
-          from huggingface_hub import snapshot_download
-
-          models_dir = Path(sys.argv[1])
-          lock = json.loads(Path("installers/runtime.lock.json").read_text(encoding="utf-8"))
-          for name, revision in lock["models"].items():
-              path = Path(snapshot_download(
-                  "Systran/faster-whisper-" + name,
-                  revision=revision,
-                  cache_dir=str(models_dir),
-                  allow_patterns=["config.json", "model.bin", "tokenizer.json", "vocabulary.json", "vocabulary.txt"],
-              ))
-              ref = path.parent.parent / "refs" / "main"
-              ref.parent.mkdir(exist_ok=True)
-              tmp = ref.with_suffix(".tmp")
-              tmp.write_text(path.name, encoding="utf-8")
-              tmp.replace(ref)
-              for required in ("model.bin", "config.json", "tokenizer.json"):
-                  assert (path / required).is_file() and (path / required).stat().st_size > 0
-          if os.environ["RECOVERY"] == "true":
-              subprocess.run([
-                  sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                  "--index-url", "https://download.pytorch.org/whl/cpu",
-                  "torch==2.6.0+cpu", "torchaudio==2.6.0+cpu",
-              ], check=True)
-              subprocess.run([
-                  sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                  "transformers==5.24.1", "safetensors==0.8.0",
-              ], check=True)
-              subprocess.run([
-                  sys.executable, "-m", "pip", "install", "--no-cache-dir",
-                  "--no-deps", "stable-ts==2.19.1",
-              ], check=True)
-              hf_dir = Path(os.environ["RUNNER_TEMP"]) / "vrs-apex-hf"
-              snapshot_download(
-                  "Oriserve/Whisper-Hindi2Hinglish-Apex",
-                  revision="f3214eed20b4e4d4144e739982d911f87b9cb223",
-                  local_dir=str(hf_dir),
-              )
-              cfg_path = hf_dir / "config.json"
-              cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-              cfg["dtype"] = "float32"
-              cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-              gen_path = hf_dir / "generation_config.json"
-              gen = json.loads(gen_path.read_text(encoding="utf-8"))
-              gen["alignment_heads"] = [[2, 4], [2, 11], [3, 3], [3, 6], [3, 11], [3, 14]]
-              gen_path.write_text(json.dumps(gen, indent=2), encoding="utf-8")
-              out_dir = models_dir / "apex-ct2-int8"
-              from ctranslate2.converters import TransformersConverter
-              TransformersConverter(
-                  str(hf_dir),
-                  copy_files=["tokenizer.json", "preprocessor_config.json"],
-              ).convert(str(out_dir), quantization="int8", force=True)
-              ct2_cfg_path = out_dir / "config.json"
-              ct2_cfg = json.loads(ct2_cfg_path.read_text(encoding="utf-8"))
-              ct2_cfg["alignment_heads"] = [[2, 4], [2, 11], [3, 3], [3, 6], [3, 11], [3, 14]]
-              ct2_cfg_path.write_text(json.dumps(ct2_cfg, indent=2), encoding="utf-8")
-              shutil.rmtree(hf_dir, ignore_errors=True)
-              for required in ("model.bin", "config.json", "tokenizer.json", "preprocessor_config.json"):
-                  assert (out_dir / required).is_file() and (out_dir / required).stat().st_size > 0
-          EOF
+          python3 engine/github_model_setup.py "$models" base
           printf 'VRS_MODEL_DIR=%s\n' "$models" >> "$GITHUB_ENV"
+      - name: Prepare offline Apex and Stable-ts for eligible narration before private fetch
+        if: ${{ steps.metadata.outputs.recovery == 'true' || steps.metadata.outputs.apex_eligible == 'true' }}
+        run: |
+          umask 077
+          python3 engine/github_model_setup.py "$VRS_MODEL_DIR" apex
       - name: 01 · Retrieve and verify private inputs after prerequisites
         if: ${{ !inputs.probe }}
         env:
@@ -189,9 +126,10 @@ jobs:
           REQUEST: ${{ inputs.request_id }}
           OPERATION: ${{ steps.metadata.outputs.operation }}
           RECOVERY: ${{ steps.metadata.outputs.recovery }}
+          APEX_ELIGIBLE: ${{ steps.metadata.outputs.apex_eligible || 'false' }}
         run: |
           umask 077
-          python3 engine/github_production.py fetch "$VRS_JOB" "$REQUEST" "$OPERATION" "$RECOVERY" >/dev/null 2>&1 ||
+          python3 engine/github_production.py fetch "$VRS_JOB" "$REQUEST" "$OPERATION" "$RECOVERY" "$APEX_ELIGIBLE" >/dev/null 2>&1 ||
             { echo 'Private input verification failed'; exit 1; }
       - name: 02 · Whisper transcription and optional Apex and stable-ts recovery
         id: transcribe
@@ -214,6 +152,40 @@ jobs:
           umask 077
           bash engine/github_render_sandbox.sh >/dev/null 2>&1 ||
             { echo 'Isolated render failed'; exit 1; }
+      - name: 02 · Recognize narration with Faster Whisper and align captions
+        id: speech
+        if: ${{ steps.metadata.outputs.operation == 'produce' }}
+        run: |
+          umask 077
+          bash engine/github_render_sandbox.sh speech >/dev/null 2>&1 ||
+            { echo 'Isolated recognition and alignment failed'; exit 1; }
+          if test -f "$VRS_JOB/needs-apex" && test ! -L "$VRS_JOB/needs-apex"; then
+            echo 'apex=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: 03 · Recover and align caption timings
+        id: recovery
+        if: ${{ steps.speech.outputs.apex == 'true' }}
+        continue-on-error: true
+        run: |
+          umask 077
+          bash engine/github_render_sandbox.sh recovery >/dev/null 2>&1 ||
+            { echo 'Isolated caption recovery failed'; exit 1; }
+      - name: 05 · Generate assets and compose narration-driven motion graphics
+        id: compose
+        if: ${{ steps.metadata.outputs.operation == 'produce' && steps.speech.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          umask 077
+          bash engine/github_render_sandbox.sh compose >/dev/null 2>&1 ||
+            { echo 'Isolated composition failed; retaining caption checkpoint'; exit 1; }
+      - name: 06 · Capture with HyperFrames, encode with FFmpeg and verify CapCut media
+        id: production_capture
+        if: ${{ steps.compose.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          umask 077
+          bash engine/github_render_sandbox.sh capture >/dev/null 2>&1 ||
+            { echo 'Isolated capture failed; retaining composition checkpoint'; exit 1; }
       - name: 07 · Transfer verified output to private storage
         id: delivery
         if: ${{ !inputs.probe }}
@@ -240,6 +212,10 @@ jobs:
           PREPARE: ${{ steps.prepare.outcome }}
           CAPTURE: ${{ steps.capture.outcome }}
           DELIVERY: ${{ steps.delivery.outcome }}
+          SPEECH: ${{ steps.speech.outcome }}
+          RECOVERY_PHASE: ${{ steps.recovery.outcome }}
+          COMPOSE: ${{ steps.compose.outcome }}
+          PRODUCTION_CAPTURE: ${{ steps.production_capture.outcome }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
           import json
@@ -251,11 +227,20 @@ jobs:
               ("TRANSCRIBE", "02 · Speech recognition and recovery"),
               ("PREPARE", "03–04 · Caption readiness, assets, composition and branding"),
               ("CAPTURE", "05–06 · Video capture, encoding and verified companion files"),
+              ("SPEECH", "02 · Faster Whisper and alignment"),
+              ("RECOVERY_PHASE", "03 · Conditional Apex recovery"),
+              ("COMPOSE", "05 · Asset generation, composition and motion"),
+              ("PRODUCTION_CAPTURE", "06 · Capture, encoding and CapCut media"),
               ("DELIVERY", "07 · Private output transfer"),
           ]:
               status = os.environ.get(key)
               if status in {"success", "failure", "cancelled", "skipped"}:
                   print(f"- {title}: **{status}**")
+          state = delivery / "state.json"
+          if state.is_file():
+              status = json.loads(state.read_text()).get("status")
+              if status in {"complete","caption-review","scene-review","aligned","composed","recovery"}:
+                  print(f"- Automatic production result: **{status}**")
           for operation, keys in {
               "transcribe": ("transcribeSeconds", "wordCount"),
               "prepare": ("prepareSeconds", "modelsRequired", "modelsPrepared", "modelsReused"),

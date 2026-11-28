@@ -24,7 +24,7 @@ ffprobe=$(realpath "$(command -v ffprobe)")
 if [[ ${1:-} == probe ]]; then
   command=(/tools/node /engine/github_sandbox_probe.mjs)
 else
-  command=("$python" /engine/github_production.py execute /job)
+  command=("$python" /engine/github_production.py execute /job "$@")
 fi
 extra_binds=()
 if [[ -d /opt/google/chrome ]]; then

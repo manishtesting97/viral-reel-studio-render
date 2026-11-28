@@ -4,6 +4,19 @@
       "type": "object",
       "properties": {
         "groundShadows": {"type": "boolean"},
+        "entrance": {"enum": ["cut", "fade", "slide"]},
+        "labels": {
+          "type": "array", "minItems": 0, "maxItems": 8,
+          "items": {
+            "type": "object",
+            "properties": {
+              "text": {"type": "string", "minLength": 1, "maxLength": 32},
+              "position": {"type": "array", "minItems": 3, "maxItems": 3,
+                           "items": {"type": "number", "minimum": -24, "maximum": 24}}
+            },
+            "required": ["text", "position"], "additionalProperties": false
+          }
+        },
         "parts": {
           "type": "array",
           "items": {
@@ -69,6 +82,7 @@
                 "minimum": 0.22,
                 "maximum": 1
               },
+              "emission": {"type": "number", "minimum": 0, "maximum": 1},
               "opacity": {
                 "type": "number",
                 "minimum": 0.15,
@@ -159,9 +173,11 @@
               "action": {
                 "enum": [
                   "reveal",
+                  "hide",
                   "move",
                   "rotate",
-                  "camera"
+                  "camera",
+                  "camera-orbit"
                 ]
               },
               "anchor": {
@@ -499,7 +515,27 @@
                       "required": ["id", "shapes"], "additionalProperties": false
                     }
                   },
-                  "events": {"$ref": "#/$defs/motionEvents"}
+                  "entrance": {"enum": ["cut", "fade", "slide"]},
+                  "events": {
+                    "type": "array", "minItems": 0, "maxItems": 24,
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "action": {"enum": ["reveal", "type", "connect", "highlight", "focus", "transform", "exit", "move", "scale", "pulse", "sequence"]},
+                        "target": {"$ref": "#/$defs/visualId"},
+                        "anchor": {"type": "string", "minLength": 1, "maxLength": 120},
+                        "at": {"type": "number", "minimum": 0, "maximum": 180},
+                        "duration": {"type": "number", "minimum": 0.05, "maximum": 30},
+                        "value": {"anyOf": [
+                          {"type": "string", "minLength": 1, "maxLength": 200},
+                          {"type": "array", "minItems": 2, "maxItems": 2,
+                           "items": {"type": "number", "minimum": -400, "maximum": 400}}
+                        ]},
+                        "occurrence": {"type": "integer", "minimum": 1, "maximum": 20}
+                      },
+                      "required": ["action", "target"], "additionalProperties": false
+                    }
+                  }
                 },
                 "required": ["layers"], "additionalProperties": false
               },

@@ -92,8 +92,9 @@ def validate(manifest, limit):
         if any(name not in {"index.html", "voice.wav", "captions.ass"} and not name.startswith("assets/")
                for name in files):
             raise ValueError("Unexpected render file.")
-    elif op == "prepare":
-        if preset is not None or language is not None:
+    elif op in {"prepare", "produce"}:
+        if language is not None or (preset is not None if op == "prepare" else
+                                    preset not in {"draft", "standard", "premium"}):
             raise ValueError("Invalid scene preparation inputs.")
         if not any(re.fullmatch(r"projects/[A-Za-z0-9_.-]+/plan\.json", name) for name in files):
             raise ValueError("Invalid scene preparation inputs.")
@@ -158,7 +159,7 @@ def copy_pipe(src, dest, limit, timeout, progress=None):
 
 
 def write_package(output, root, operation, revision, limit, preset=None, language=None):
-    if operation == "prepare":
+    if operation in {"prepare", "produce"}:
         names = []
         for top in ("projects", "brand-profiles", "style-library", "assets"):
             base = root / top
