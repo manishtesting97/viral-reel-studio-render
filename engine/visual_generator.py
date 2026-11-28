@@ -511,6 +511,9 @@ COMMON_CSS = """/* Auto-generated universal editorial scene stylesheet inheritin
   padding: 36px;
   box-shadow: 0 22px 50px rgba(24, 20, 18, 0.08);
 }
+#stage[data-mobile-template] .vrs-cta-card[data-ev="creator-profile"] {
+  flex:0 1 auto;align-self:center;width:min(100%,780px);padding:40px 32px;gap:16px;
+}
 .vrs-portrait-ring {
   padding: 10px;
   border-radius: 50%;
